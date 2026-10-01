@@ -41,12 +41,32 @@
 /* Maximum time we allow a connection to be blocked because of head-of-the-line buffers. After this delay, connection is considered in error. */
 #define MAX_HOTL_BLOCKING_TIME	1000	/* ms */
 
+struct socket;
+struct fd_cnx_transport_ops;
+
+enum fd_cnx_transport_type {
+	FD_CNX_TRANSPORT_KERNEL,
+	FD_CNX_TRANSPORT_USRSCTP
+};
+
+struct fd_cnx_transport {
+	enum fd_cnx_transport_type type;
+
+	union {
+		int kernel_fd;
+		struct socket *usrsctp;
+	} endpoint;
+
+	const struct fd_cnx_transport_ops *ops;
+};
+
 /* The connection context structure */
 struct cnxctx {
 	char		cc_id[100];	/* The name of this connection. the first 5 chars are reserved for flags display (cc_state). */
 	char		cc_remid[60];	/* Id of remote peer */
 
 	int 		cc_socket;	/* The socket object of the connection -- <=0 if no socket is created */
+	struct fd_cnx_transport cc_transport;
 
 	int 		cc_family;	/* AF_INET or AF_INET6 (mixed) */
 	int 		cc_proto;	/* IPPROTO_TCP or IPPROTO_SCTP */
@@ -93,6 +113,9 @@ int  fd_cnx_teststate(struct cnxctx * conn, uint32_t flag);
 void fd_cnx_addstate(struct cnxctx * conn, uint32_t orstate);
 void fd_cnx_setstate(struct cnxctx * conn, uint32_t abstate);
 struct fifo * fd_cnx_target_queue(struct cnxctx * conn);
+int fd_cnx_transport_valid(struct cnxctx * conn);
+int fd_cnx_transport_kernel_fd(struct cnxctx * conn);
+void fd_cnx_transport_close(struct cnxctx * conn);
 
 
 /* Socket */
@@ -147,4 +170,3 @@ void fd_sctp3436_destroy(struct cnxctx * conn);
 #endif /* DISABLE_SCTP */
 
 #endif /* _CNXCTX_H */
-

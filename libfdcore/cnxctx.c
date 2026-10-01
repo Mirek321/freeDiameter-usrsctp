@@ -88,12 +88,48 @@ static struct cnxctx * fd_cnx_init(int full)
 
 	CHECK_MALLOC_DO( conn = malloc(sizeof(struct cnxctx)), return NULL );
 	memset(conn, 0, sizeof(struct cnxctx));
+	conn->cc_socket = -1;
+	conn->cc_transport.type = FD_CNX_TRANSPORT_KERNEL;
+	conn->cc_transport.endpoint.kernel_fd = -1;
 
 	if (full) {
 		CHECK_FCT_DO( fd_fifo_new ( &conn->cc_incoming, 5 ), return NULL );
 	}
 
 	return conn;
+}
+
+int fd_cnx_transport_valid(struct cnxctx * conn)
+{
+	if (!conn)
+		return 0;
+
+	if (conn->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP)
+		return conn->cc_transport.endpoint.usrsctp != NULL;
+
+	return conn->cc_socket > 0;
+}
+
+int fd_cnx_transport_kernel_fd(struct cnxctx * conn)
+{
+	if (!conn || (conn->cc_transport.type != FD_CNX_TRANSPORT_KERNEL))
+		return -1;
+
+	return conn->cc_socket;
+}
+
+void fd_cnx_transport_close(struct cnxctx * conn)
+{
+	if (!conn || (conn->cc_transport.type != FD_CNX_TRANSPORT_KERNEL))
+		return;
+
+	if (conn->cc_socket > 0) {
+		shutdown(conn->cc_socket, SHUT_RDWR);
+		close(conn->cc_socket);
+	}
+
+	conn->cc_socket = -1;
+	conn->cc_transport.endpoint.kernel_fd = -1;
 }
 
 #define CC_ID_HDR "{----} "
@@ -784,7 +820,7 @@ static void * rcvthr_notls_tcp(void * arg)
 	struct cnxctx * conn = arg;
 
 	TRACE_ENTRY("%p", arg);
-	CHECK_PARAMS_DO(conn && (conn->cc_socket > 0), goto out);
+	CHECK_PARAMS_DO(conn && fd_cnx_transport_valid(conn), goto out);
 
 	/* Set the thread name */
 	{
@@ -874,7 +910,7 @@ static void * rcvthr_notls_sctp(void * arg)
 	int	  event;
 
 	TRACE_ENTRY("%p", arg);
-	CHECK_PARAMS_DO(conn && (conn->cc_socket > 0), goto fatal);
+	CHECK_PARAMS_DO(conn && fd_cnx_transport_valid(conn), goto fatal);
 
 	/* Set the thread name */
 	{
@@ -1128,7 +1164,7 @@ static void * rcvthr_tls_single(void * arg)
 	struct cnxctx * conn = arg;
 
 	TRACE_ENTRY("%p", arg);
-	CHECK_PARAMS_DO(conn && (conn->cc_socket > 0), return NULL );
+	CHECK_PARAMS_DO(conn && fd_cnx_transport_valid(conn), return NULL );
 
 	/* Set the thread name */
 	{
@@ -1554,7 +1590,7 @@ int fd_cnx_receive(struct cnxctx * conn, struct timespec * timeout, unsigned cha
 	void * ev_data;
 
 	TRACE_ENTRY("%p %p %p %p", conn, timeout, buf, len);
-	CHECK_PARAMS(conn && (conn->cc_socket > 0) && buf && len);
+	CHECK_PARAMS(conn && fd_cnx_transport_valid(conn) && buf && len);
 	CHECK_PARAMS(conn->cc_rcvthr != (pthread_t)NULL);
 	CHECK_PARAMS(conn->cc_alt == NULL);
 
@@ -1643,7 +1679,7 @@ int fd_cnx_send(struct cnxctx * conn, unsigned char * buf, size_t len)
 {
 	TRACE_ENTRY("%p %p %zd", conn, buf, len);
 
-	CHECK_PARAMS(conn && (conn->cc_socket > 0) && (! fd_cnx_teststate(conn, CC_STATUS_ERROR)) && buf && len);
+	CHECK_PARAMS(conn && fd_cnx_transport_valid(conn) && (! fd_cnx_teststate(conn, CC_STATUS_ERROR)) && buf && len);
 
 	TRACE_DEBUG(FULL, "Sending %zdb %sdata on connection %s", len, fd_cnx_teststate(conn, CC_STATUS_TLS) ? "TLS-protected ":"", conn->cc_id);
 
@@ -1793,11 +1829,7 @@ void fd_cnx_destroy(struct cnxctx * conn)
 	CHECK_FCT_DO( fd_thr_term(&conn->cc_rcvthr), /* continue */ );
 
 	/* Shut the connection down */
-	if (conn->cc_socket > 0) {
-		shutdown(conn->cc_socket, SHUT_RDWR);
-		close(conn->cc_socket);
-		conn->cc_socket = -1;
-	}
+	fd_cnx_transport_close(conn);
 
 	/* Empty and destroy FIFO list */
 	if (conn->cc_incoming) {

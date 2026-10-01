@@ -106,7 +106,7 @@ SUBDIRS(include/freeDiameter)
 
 # Build the bundled userspace SCTP library only when requested.
 IF(USE_USRSCTP)
-  SET(sctp_build_programs OFF)
+  SET(sctp_build_programs OFF CACHE BOOL "Build usrsctp example programs" FORCE)
   ADD_SUBDIRECTORY(usrsctp)
   SET_PROPERTY(TARGET usrsctp PROPERTY INTERFACE_INCLUDE_DIRECTORIES "")
 ENDIF(USE_USRSCTP)
