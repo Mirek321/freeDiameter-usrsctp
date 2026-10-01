@@ -104,6 +104,13 @@ INCLUDE_DIRECTORIES(include)
 INCLUDE_DIRECTORIES(${CMAKE_CURRENT_BINARY_DIR}/include)
 SUBDIRS(include/freeDiameter)
 
+# Build the bundled userspace SCTP library only when requested.
+IF(USE_USRSCTP)
+  SET(sctp_build_programs OFF)
+  ADD_SUBDIRECTORY(usrsctp)
+  SET_PROPERTY(TARGET usrsctp PROPERTY INTERFACE_INCLUDE_DIRECTORIES "")
+ENDIF(USE_USRSCTP)
+
 # Location for the source code
 SUBDIRS(libfdproto)
 SUBDIRS(libfdcore)
