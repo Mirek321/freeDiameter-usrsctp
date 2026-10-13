@@ -42,7 +42,43 @@
 #define MAX_HOTL_BLOCKING_TIME	1000	/* ms */
 
 struct socket;
-struct fd_cnx_transport_ops;
+struct cnxctx;
+struct fd_usrsctp_cbctx;
+struct fd_cnx_transport_ops {
+	int (*create_server)(struct cnxctx *conn,
+                     int family,
+                     struct fd_list *endpoints,
+                     uint16_t port);
+	int (*listen)(struct cnxctx *conn, int backlog);
+	int (*accept)(struct cnxctx *listener, struct cnxctx *accepted);
+	int (*connect)(struct cnxctx *conn,
+	               int no_ip6,
+	               uint16_t port,
+	               struct fd_list *remote,
+	               struct fd_list *local);
+	int (*start_clear)(struct cnxctx *conn, int loop);
+	ssize_t (*recv)(struct cnxctx *conn, void *buffer, size_t length);
+	int (*recv_meta)(struct cnxctx *conn,
+	                 uint16_t *stream,
+	                 uint8_t **buffer,
+	                 size_t *length,
+	                 int *event);
+	ssize_t (*send)(struct cnxctx *conn,
+	                uint16_t stream,
+	                const void *buffer,
+	                size_t length,
+	                int unordered);
+	int (*get_streams)(struct cnxctx *conn,
+	                   uint16_t *in,
+	                   uint16_t *out);
+	int (*get_remote_eps)(struct cnxctx *conn,
+	                      struct fd_list *eps);
+	void (*close)(struct cnxctx *conn);
+};
+
+#ifdef USE_USRSCTP
+extern const struct fd_cnx_transport_ops fd_usrsctp_ops;
+#endif
 
 enum fd_cnx_transport_type {
 	FD_CNX_TRANSPORT_KERNEL,
@@ -60,6 +96,19 @@ struct fd_cnx_transport {
 	const struct fd_cnx_transport_ops *ops;
 };
 
+#ifdef USE_USRSCTP
+struct fd_usrsctp_cbctx {
+	pthread_mutex_t lock;
+	pthread_cond_t idle;
+	struct cnxctx *conn;
+	unsigned int callback_refs;
+	int closing;
+	uint8_t *partial;
+	size_t partial_len;
+	size_t partial_cap;
+};
+#endif
+
 /* The connection context structure */
 struct cnxctx {
 	char		cc_id[100];	/* The name of this connection. the first 5 chars are reserved for flags display (cc_state). */
@@ -67,6 +116,9 @@ struct cnxctx {
 
 	int 		cc_socket;	/* The socket object of the connection -- <=0 if no socket is created */
 	struct fd_cnx_transport cc_transport;
+#ifdef USE_USRSCTP
+	struct fd_usrsctp_cbctx *cc_usrsctp_cbctx;
+#endif
 
 	int 		cc_family;	/* AF_INET or AF_INET6 (mixed) */
 	int 		cc_proto;	/* IPPROTO_TCP or IPPROTO_SCTP */

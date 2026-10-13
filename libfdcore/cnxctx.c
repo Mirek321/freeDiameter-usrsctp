@@ -39,6 +39,7 @@
 #include <net/if.h>
 #include <ifaddrs.h> /* for getifaddrs */
 #include <sys/uio.h> /* writev */
+#include <stdint.h>
 
 /* The maximum size of Diameter message we accept to receive (<= 2^24) to avoid too big mallocs in case of trashed headers */
 #ifndef DIAMETER_MSG_SIZE_MAX
@@ -120,8 +121,14 @@ int fd_cnx_transport_kernel_fd(struct cnxctx * conn)
 
 void fd_cnx_transport_close(struct cnxctx * conn)
 {
-	if (!conn || (conn->cc_transport.type != FD_CNX_TRANSPORT_KERNEL))
+	if (!conn)
 		return;
+
+	if (conn->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP) {
+		if (conn->cc_transport.ops && conn->cc_transport.ops->close)
+			conn->cc_transport.ops->close(conn);
+		return;
+	}
 
 	if (conn->cc_socket > 0) {
 		shutdown(conn->cc_socket, SHUT_RDWR);
@@ -213,11 +220,24 @@ struct cnxctx * fd_cnx_serv_sctp(uint16_t port, struct fd_list * ep_list)
 		cnx->cc_family = AF_INET6; /* can create socket for both IP and IPv6 */
 	}
 
-	/* Create the socket */
+	/* Create and bind the socket using the configured SCTP backend. */
+#ifdef USE_USRSCTP
+	cnx->cc_transport.type = FD_CNX_TRANSPORT_USRSCTP;
+	cnx->cc_transport.ops = &fd_usrsctp_ops;
+	cnx->cc_proto = IPPROTO_SCTP;
+	CHECK_FCT_DO( cnx->cc_transport.ops->create_server(cnx, cnx->cc_family, ep_list, port), goto error );
+#else
+	cnx->cc_transport.type = FD_CNX_TRANSPORT_KERNEL;
 	CHECK_FCT_DO( fd_sctp_create_bind_server( &cnx->cc_socket, cnx->cc_family, ep_list, port ), goto error );
+	cnx->cc_transport.endpoint.kernel_fd = cnx->cc_socket;
+#endif
 
 	/* Generate the name for the connection object */
+	#ifdef USE_USRSCTP
+	snprintf(cnx->cc_id, sizeof(cnx->cc_id), CC_ID_HDR "SCTP srv :%hu (usrsctp)", port);
+	#else
 	snprintf(cnx->cc_id, sizeof(cnx->cc_id), CC_ID_HDR "SCTP srv :%hu (%d)", port, cnx->cc_socket);
+	#endif
 
 	cnx->cc_proto = IPPROTO_SCTP;
 
@@ -241,7 +261,13 @@ int fd_cnx_serv_listen(struct cnxctx * conn)
 
 #ifndef DISABLE_SCTP
 		case IPPROTO_SCTP:
-			CHECK_FCT(fd_sctp_listen(conn->cc_socket));
+		#ifdef USE_USRSCTP
+			if (conn->cc_transport.ops) {
+				CHECK_FCT(conn->cc_transport.ops->listen(conn, 5));
+				break;
+			}
+		#endif /* USE_USRSCTP */
+			CHECK_FCT(fd_sctp_listen(fd_cnx_transport_kernel_fd(conn)));
 			break;
 #endif /* DISABLE_SCTP */
 
@@ -262,6 +288,25 @@ struct cnxctx * fd_cnx_serv_accept(struct cnxctx * serv)
 
 	TRACE_ENTRY("%p", serv);
 	CHECK_PARAMS_DO(serv, return NULL);
+
+#ifdef USE_USRSCTP
+	if (serv->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP) {
+		CHECK_MALLOC_DO(cli = fd_cnx_init(1), return NULL);
+		cli->cc_transport.type = FD_CNX_TRANSPORT_USRSCTP;
+		cli->cc_transport.ops = serv->cc_transport.ops;
+		cli->cc_family = serv->cc_family;
+		cli->cc_proto = serv->cc_proto;
+		CHECK_FCT_DO(cli->cc_transport.ops->accept(serv, cli), {
+			fd_cnx_destroy(cli);
+			return NULL;
+		});
+		LOG_D("Incoming userspace SCTP connection: '%s'", fd_cnx_getid(cli));
+		LOG_A("%s : client '%s' (SCTP:%d, %d/%d streams)",
+		      fd_cnx_getid(serv), fd_cnx_getid(cli), -1,
+		      cli->cc_sctp_para.str_in, cli->cc_sctp_para.str_out);
+		return cli;
+	}
+#endif
 
 	/* Accept the new connection -- this is blocking until new client enters or until cancellation */
 	CHECK_SYS_DO( cli_sock = accept(serv->cc_socket, (sSA *)&ss, &ss_len), return NULL );
@@ -376,10 +421,12 @@ struct cnxctx * fd_cnx_cli_connect_sctp(int no_ip6, uint16_t port, struct fd_lis
 	CHECK_FCT_DO( ENOTSUP, );
 	return NULL;
 #else /* DISABLE_SCTP */
-	int sock = 0;
 	struct cnxctx * cnx = NULL;
 	char sa_buf[sSA_DUMP_STRLEN];
+#ifndef USE_USRSCTP
+	int sock = 0;
 	sSS primary;
+#endif
 
 	TRACE_ENTRY("%p %p", list, src_list);
 	CHECK_PARAMS_DO( list && !FD_IS_LIST_EMPTY(list), return NULL );
@@ -405,9 +452,25 @@ struct cnxctx * fd_cnx_cli_connect_sctp(int no_ip6, uint16_t port, struct fd_lis
 
 	LOG_D("Connecting to SCTP %s:%hu...", sa_buf, port);
 
-	{
-		int ret = fd_sctp_client( &sock, no_ip6, port, list, src_list );
-		if (ret != 0) {
+#ifdef USE_USRSCTP
+		CHECK_MALLOC_DO(cnx = fd_cnx_init(1), return NULL);
+		cnx->cc_transport.type = FD_CNX_TRANSPORT_USRSCTP;
+		cnx->cc_transport.ops = &fd_usrsctp_ops;
+		CHECK_FCT_DO(cnx->cc_transport.ops->connect(cnx, no_ip6, port, list, src_list),
+		             goto error);
+		snprintf(cnx->cc_id, sizeof(cnx->cc_id),
+		         CC_ID_HDR "SCTP -> %s (usrsctp)", sa_buf);
+		LOG_A("SCTP connection to %s succeeded (usrsctp, %d/%d streams).",
+		      sa_buf, cnx->cc_sctp_para.str_in, cnx->cc_sctp_para.str_out);
+		return cnx;
+
+error:
+		fd_cnx_destroy(cnx);
+		return NULL;
+#else
+		{
+			int ret = fd_sctp_client( &sock, no_ip6, port, list, src_list );
+			if (ret != 0) {
 			LOG_D("SCTP connection to [%s,...] failed: %s", sa_buf, strerror(ret));
 			return NULL;
 		}
@@ -451,6 +514,7 @@ struct cnxctx * fd_cnx_cli_connect_sctp(int no_ip6, uint16_t port, struct fd_lis
 error:
 	fd_cnx_destroy(cnx);
 	return NULL;
+#endif /* USE_USRSCTP */
 #endif /* DISABLE_SCTP */
 }
 
@@ -581,6 +645,12 @@ int fd_cnx_getremoteeps(struct cnxctx * conn, struct fd_list * eps)
 
 		#ifndef DISABLE_SCTP
 		case IPPROTO_SCTP: {
+		#ifdef USE_USRSCTP
+			if (conn->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP) {
+				CHECK_FCT(conn->cc_transport.ops->get_remote_eps(conn, eps));
+				break;
+			}
+		#endif
 			CHECK_FCT(fd_sctp_get_remote_ep(conn->cc_socket, eps));
 		}
 		break;
@@ -707,6 +777,14 @@ ssize_t fd_cnx_s_recv(struct cnxctx * conn, void *buffer, size_t length)
 {
 	ssize_t ret = 0;
 	int timedout = 0;
+#ifdef USE_USRSCTP
+	if (conn->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP) {
+		ret = conn->cc_transport.ops->recv(conn, buffer, length);
+		if (ret <= 0)
+			fd_cnx_markerror(conn);
+		return ret;
+	}
+#endif
 again:
 	ret = recv(conn->cc_socket, buffer, length, 0);
 	/* Handle special case of timeout / interrupts */
@@ -734,6 +812,35 @@ static ssize_t fd_cnx_s_sendv(struct cnxctx * conn, const struct iovec * iov, in
 {
 	ssize_t ret = 0;
 	struct timespec ts, now;
+#ifdef USE_USRSCTP
+	if (conn->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP) {
+		uint8_t *buffer;
+		size_t length = 0;
+		size_t offset = 0;
+		int i;
+		for (i = 0; i < iovcnt; i++) {
+			if (iov[i].iov_len > SIZE_MAX - length) {
+				errno = EOVERFLOW;
+				return -1;
+			}
+			length += iov[i].iov_len;
+		}
+		buffer = malloc(length ? length : 1);
+		if (!buffer) {
+			errno = ENOMEM;
+			return -1;
+		}
+		for (i = 0; i < iovcnt; i++) {
+			memcpy(buffer + offset, iov[i].iov_base, iov[i].iov_len);
+			offset += iov[i].iov_len;
+		}
+		ret = conn->cc_transport.ops->send(conn, 0, buffer, length, 0);
+		free(buffer);
+		if (ret <= 0)
+			fd_cnx_markerror(conn);
+		return ret;
+	}
+#endif
 	CHECK_SYS_DO(  clock_gettime(CLOCK_REALTIME, &ts), return -1 );
 again:
 	ret = writev(conn->cc_socket, iov, iovcnt);
@@ -975,7 +1082,13 @@ int fd_cnx_start_clear(struct cnxctx * conn, int loop)
 			break;
 #ifndef DISABLE_SCTP
 		case IPPROTO_SCTP:
-			/* Start the tcp_notls thread */
+		#ifdef USE_USRSCTP
+			if (conn->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP) {
+				CHECK_FCT(conn->cc_transport.ops->start_clear(conn, loop));
+				break;
+			}
+		#endif
+			/* Start the SCTP receiver thread for kernel sockets. */
 			CHECK_POSIX( pthread_create( &conn->cc_rcvthr, NULL, rcvthr_notls_sctp, conn ) );
 			break;
 #endif /* DISABLE_SCTP */
@@ -1494,6 +1607,9 @@ int fd_cnx_handshake(struct cnxctx * conn, int mode, int algo, char * priority, 
 
 		/* Set the push and pull callbacks */
 		if (!dtls) {
+		#ifdef USE_USRSCTP
+			if (conn->cc_transport.type != FD_CNX_TRANSPORT_USRSCTP)
+		#endif
 			GNUTLS_TRACE( gnutls_transport_set_pull_timeout_function( conn->cc_tls_para.session, (void *)fd_cnx_s_select ) );
 			GNUTLS_TRACE( gnutls_transport_set_pull_function(conn->cc_tls_para.session, (void *)fd_cnx_s_recv) );
 			GNUTLS_TRACE( gnutls_transport_set_vec_push_function(conn->cc_tls_para.session, (void *)fd_cnx_s_sendv) );
@@ -1716,6 +1832,16 @@ int fd_cnx_send(struct cnxctx * conn, unsigned char * buf, size_t len)
 						iov.iov_base = buf;
 						iov.iov_len  = len;
 
+					#ifdef USE_USRSCTP
+						if (conn->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP) {
+							ssize_t sent = conn->cc_transport.ops->send(
+								conn, (uint16_t)stream, buf, len, 0);
+							if (sent != (ssize_t)len) {
+								fd_cnx_markerror(conn);
+								return ENOTCONN;
+							}
+						} else
+					#endif
 						CHECK_SYS_DO( fd_sctp_sendstrv(conn, stream, &iov, 1), { fd_cnx_markerror(conn); return ENOTCONN; } );
 					} else {
 						/* push the data to the appropriate session */
