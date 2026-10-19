@@ -58,11 +58,6 @@ struct fd_cnx_transport_ops {
 	               struct fd_list *local);
 	int (*start_clear)(struct cnxctx *conn, int loop);
 	ssize_t (*recv)(struct cnxctx *conn, void *buffer, size_t length);
-	int (*recv_meta)(struct cnxctx *conn,
-	                 uint16_t *stream,
-	                 uint8_t **buffer,
-	                 size_t *length,
-	                 int *event);
 	ssize_t (*send)(struct cnxctx *conn,
 	                uint16_t stream,
 	                const void *buffer,
@@ -97,15 +92,36 @@ struct fd_cnx_transport {
 };
 
 #ifdef USE_USRSCTP
+struct fd_usrsctp_partial {
+	struct fd_usrsctp_partial *next;
+	struct socket *socket;
+	uint32_t assoc_id;
+	uint16_t stream;
+	uint16_t ssn;
+	int notification;
+	uint8_t *buffer;
+	size_t length;
+	size_t capacity;
+};
+
+struct fd_usrsctp_data {
+	struct fd_usrsctp_data *next;
+	uint8_t *buffer;
+	size_t length;
+	size_t offset;
+};
+
 struct fd_usrsctp_cbctx {
 	pthread_mutex_t lock;
 	pthread_cond_t idle;
 	struct cnxctx *conn;
 	unsigned int callback_refs;
 	int closing;
-	uint8_t *partial;
-	size_t partial_len;
-	size_t partial_cap;
+	pthread_t reader;
+	int reader_started;
+	struct fd_usrsctp_partial *partials;
+	struct fd_usrsctp_data *data_head;
+	struct fd_usrsctp_data *data_tail;
 };
 #endif
 

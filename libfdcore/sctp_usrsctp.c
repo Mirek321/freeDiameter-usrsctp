@@ -2,6 +2,351 @@
 #include "cnxctx.h"
 
 #include <usrsctp.h>
+#include <stdint.h>
+#include <limits.h>
+
+#define FD_USRSCTP_MAX_MESSAGE 65535
+
+static struct fd_usrsctp_cbctx *fd_usrsctp_cbctx_new(struct cnxctx *conn);
+static void fd_usrsctp_cbctx_free(struct fd_usrsctp_cbctx *ctx);
+static int fd_usrsctp_get_str_info(struct socket *sock,
+                                   uint16_t *in,
+                                   uint16_t *out);
+static int fd_usrsctp_append_endpoint_pass(uint8_t **buffer,
+                                           size_t *length,
+                                           int family,
+                                           struct fd_list *list,
+                                           uint16_t port,
+                                           uint32_t mask,
+                                           uint32_t value,
+                                           int *count);
+
+static void fd_usrsctp_free_partial(struct fd_usrsctp_partial *partial)
+{
+	if (!partial)
+		return;
+	free(partial->buffer);
+	free(partial);
+}
+
+
+
+static struct fd_usrsctp_cbctx *fd_usrsctp_cbctx_new(struct cnxctx *conn)
+{
+	struct fd_usrsctp_cbctx *ctx = calloc(1, sizeof(*ctx));
+	int ret;
+
+	if (!ctx)
+		return NULL;
+	ret = pthread_mutex_init(&ctx->lock, NULL);
+	if (ret) {
+		free(ctx);
+		errno = ret;
+		return NULL;
+	}
+	ret = pthread_cond_init(&ctx->idle, NULL);
+	if (ret) {
+		pthread_mutex_destroy(&ctx->lock);
+		free(ctx);
+		errno = ret;
+		return NULL;
+	}
+	ctx->conn = conn;
+	return ctx;
+}
+
+static void fd_usrsctp_cbctx_free(struct fd_usrsctp_cbctx *ctx)
+{
+	struct fd_usrsctp_partial *partial;
+	struct fd_usrsctp_data *queued;
+
+	if (!ctx)
+		return;
+	pthread_mutex_lock(&ctx->lock);
+	ctx->closing = 1;
+	ctx->conn = NULL;
+	pthread_cond_broadcast(&ctx->idle);
+	while (ctx->callback_refs)
+		pthread_cond_wait(&ctx->idle, &ctx->lock);
+	pthread_mutex_unlock(&ctx->lock);
+
+	while ((partial = ctx->partials) != NULL) {
+		ctx->partials = partial->next;
+		fd_usrsctp_free_partial(partial);
+	}
+	while ((queued = ctx->data_head) != NULL) {
+		ctx->data_head = queued->next;
+		free(queued->buffer);
+		free(queued);
+	}
+	pthread_cond_destroy(&ctx->idle);
+	pthread_mutex_destroy(&ctx->lock);
+	free(ctx);
+}
+
+static int fd_usrsctp_cbctx_acquire(struct fd_usrsctp_cbctx *ctx,
+                                    struct cnxctx **conn)
+{
+	int ret = 0;
+	if (!ctx)
+		return 0;
+	pthread_mutex_lock(&ctx->lock);
+	if (ctx->closing || !ctx->conn) {
+		ret = 0;
+	} else {
+		ctx->callback_refs++;
+		*conn = ctx->conn;
+		ret = 1;
+	}
+	pthread_mutex_unlock(&ctx->lock);
+	return ret;
+}
+
+static void fd_usrsctp_cbctx_release(struct fd_usrsctp_cbctx *ctx)
+{
+	pthread_mutex_lock(&ctx->lock);
+	if (--ctx->callback_refs == 0)
+		pthread_cond_broadcast(&ctx->idle);
+	pthread_mutex_unlock(&ctx->lock);
+}
+
+
+
+
+
+static int fd_usrsctp_handle_message(struct fd_usrsctp_cbctx *ctx,
+                                     struct socket *sock,
+                                     void *data,
+                                     size_t datalen,
+                                     struct sctp_rcvinfo rcv,
+                                     int flags)
+{
+	struct fd_usrsctp_partial **link;
+	struct fd_usrsctp_partial *partial;
+	struct cnxctx *conn = NULL;
+	uint8_t *complete = NULL;
+	size_t complete_len = 0;
+	int notification = !!(flags & MSG_NOTIFICATION);
+	int event = 0;
+	int ret = 0;
+
+	if (!fd_usrsctp_cbctx_acquire(ctx, &conn)) {
+		free(data);
+		return 1;
+	}
+
+	pthread_mutex_lock(&ctx->lock);
+	for (link = &ctx->partials; *link; link = &(*link)->next) {
+		partial = *link;
+		if (partial->socket == sock &&
+		    partial->assoc_id == rcv.rcv_assoc_id &&
+		    partial->stream == rcv.rcv_sid &&
+		    partial->ssn == rcv.rcv_ssn &&
+		    partial->notification == notification)
+			break;
+	}
+	partial = *link;
+	if (!partial) {
+		partial = calloc(1, sizeof(*partial));
+		if (!partial) {
+			ret = ENOMEM;
+			goto unlock;
+		}
+		partial->socket = sock;
+		partial->assoc_id = rcv.rcv_assoc_id;
+		partial->stream = rcv.rcv_sid;
+		partial->ssn = rcv.rcv_ssn;
+		partial->notification = notification;
+		partial->next = ctx->partials;
+		ctx->partials = partial;
+		link = &ctx->partials;
+	}
+	if (datalen > FD_USRSCTP_MAX_MESSAGE - partial->length) {
+		*link = partial->next;
+		fd_usrsctp_free_partial(partial);
+		ret = EMSGSIZE;
+		goto unlock;
+	}
+	if (partial->length + datalen > partial->capacity) {
+		size_t capacity = partial->capacity ? partial->capacity : 4096;
+		uint8_t *new_buffer;
+		while (capacity < partial->length + datalen) {
+			if (capacity > FD_USRSCTP_MAX_MESSAGE / 2) {
+				capacity = FD_USRSCTP_MAX_MESSAGE;
+				break;
+			}
+			capacity *= 2;
+		}
+		new_buffer = realloc(partial->buffer, capacity);
+		if (!new_buffer) {
+			ret = ENOMEM;
+			goto unlock;
+		}
+		partial->buffer = new_buffer;
+		partial->capacity = capacity;
+	}
+	memcpy(partial->buffer + partial->length, data, datalen);
+	partial->length += datalen;
+	if (flags & MSG_EOR) {
+		*link = partial->next;
+		complete = partial->buffer;
+		complete_len = partial->length;
+		notification = partial->notification;
+		free(partial);
+	}
+
+unlock:
+	pthread_mutex_unlock(&ctx->lock);
+	free(data);
+
+	if (ret == 0 && complete) {
+		if (notification) {
+			if (complete_len < sizeof(((union sctp_notification *)0)->sn_header)) {
+				ret = EPROTO;
+			} else {
+				union sctp_notification *notif = (union sctp_notification *)complete;
+				switch (notif->sn_header.sn_type) {
+				case SCTP_PEER_ADDR_CHANGE:
+					event = FDEVP_CNX_EP_CHANGE;
+					break;
+				case SCTP_SHUTDOWN_EVENT:
+					event = FDEVP_CNX_SHUTDOWN;
+					break;
+				case SCTP_ASSOC_CHANGE:
+					event = FDEVP_CNX_EP_CHANGE;
+					break;
+				default:
+					event = FDEVP_CNX_ERROR;
+					break;
+				}
+				if (event == FDEVP_CNX_ERROR)
+					fd_cnx_markerror(conn);
+				else
+					ret = fd_event_send(fd_cnx_target_queue(conn), event, 0, NULL);
+			}
+			free(complete);
+		} else if (fd_cnx_teststate(conn, CC_STATUS_TLS)) {
+			/* TLS: keep the bytes queued for the recv op, which the TLS pull callback drains. */
+			struct fd_usrsctp_data *queued = calloc(1, sizeof(*queued));
+			if (!queued) {
+				ret = ENOMEM;
+				free(complete);
+			} else {
+				queued->buffer = complete;
+				queued->length = complete_len;
+				pthread_mutex_lock(&ctx->lock);
+				if (ctx->closing) {
+					ret = ECANCELED;
+				} else {
+					if (ctx->data_tail)
+						ctx->data_tail->next = queued;
+					else
+						ctx->data_head = queued;
+					ctx->data_tail = queued;
+					pthread_cond_broadcast(&ctx->idle);
+				}
+				pthread_mutex_unlock(&ctx->lock);
+				if (ret) {
+					free(queued);
+					free(complete);
+				}
+			}
+		} else {
+			/* Clear text: copy into a message buffer the core owns, then queue it. */
+			struct fd_cnx_rcvdata rcv_data;
+			struct fd_msg_pmdl *pmdl;
+			uint8_t *buffer;
+
+			if (complete_len > FD_USRSCTP_MAX_MESSAGE) {
+				ret = EMSGSIZE;
+			} else {
+				buffer = malloc(fd_msg_pmdl_sizewithoverhead(complete_len));
+				if (!buffer) {
+					ret = ENOMEM;
+				} else {
+					if (complete_len)
+						memcpy(buffer, complete, complete_len);
+					pmdl = fd_msg_pmdl_get_inbuf(buffer, complete_len);
+					fd_list_init(&pmdl->sentinel, NULL);
+					ret = pthread_mutex_init(&pmdl->lock, NULL);
+					if (ret) {
+						free(buffer);
+					} else {
+						rcv_data.length = complete_len;
+						rcv_data.buffer = buffer;
+						fd_hook_call(HOOK_DATA_RECEIVED, NULL, NULL, &rcv_data, pmdl);
+						ret = fd_event_send(fd_cnx_target_queue(conn), FDEVP_CNX_MSG_RECV,
+						                    complete_len, buffer);
+						if (ret) {
+							pthread_mutex_destroy(&pmdl->lock);
+							free(buffer);
+						}
+					}
+				}
+			}
+			free(complete);
+		}
+	}
+	if (ret) {
+		LOG_E("usrsctp receive callback failed: %s", strerror(ret));
+		if (conn->cc_transport.endpoint.usrsctp == sock)
+			fd_cnx_markerror(conn);
+	}
+
+	fd_usrsctp_cbctx_release(ctx);
+	return 1;
+}
+
+static void *fd_usrsctp_reader(void *arg)
+{
+	struct cnxctx *conn = arg;
+	struct fd_usrsctp_cbctx *ctx = conn->cc_usrsctp_cbctx;
+	struct socket *sock = conn->cc_transport.endpoint.usrsctp;
+
+	for (;;) {
+		struct sctp_rcvinfo rcv;
+		socklen_t infolen = sizeof(rcv);
+		unsigned int infotype = SCTP_RECVV_RCVINFO;
+		int flags = 0;
+		uint8_t *data;
+		ssize_t n;
+
+		data = malloc(FD_USRSCTP_MAX_MESSAGE);
+		n = data ? usrsctp_recvv(sock, data, FD_USRSCTP_MAX_MESSAGE,
+		                         NULL, NULL, &rcv, &infolen, &infotype,
+		                         &flags) : -1;
+		if (n <= 0) {
+			free(data);
+			break;
+		}
+		fd_usrsctp_handle_message(ctx, sock, data, (size_t)n, rcv, flags);
+	}
+
+	/* Read error or end of association: report it unless we are closing. */
+	{
+		struct cnxctx *live = NULL;
+		if (fd_usrsctp_cbctx_acquire(ctx, &live)) {
+			fd_cnx_markerror(live);
+			fd_usrsctp_cbctx_release(ctx);
+		}
+	}
+	return NULL;
+}
+
+
+
+static pthread_once_t fd_usrsctp_once = PTHREAD_ONCE_INIT;
+
+/* usrsctp keeps process-wide state: initialise it once, before the first socket. */
+static void fd_usrsctp_global_init(void)
+{
+	usrsctp_init(0, NULL, NULL);
+}
+
+static void fd_usrsctp_ensure_init(void)
+{
+	pthread_once(&fd_usrsctp_once, fd_usrsctp_global_init);
+}
 
 static int fd_usrsctp_create_server(struct cnxctx *conn,
                                     int family,
@@ -21,15 +366,25 @@ static int fd_usrsctp_create_server(struct cnxctx *conn,
     if (!conn || !port || (family != AF_INET && family != AF_INET6))
         return EINVAL;
 
+    fd_usrsctp_ensure_init();
+    conn->cc_usrsctp_cbctx = fd_usrsctp_cbctx_new(conn);
+    if (!conn->cc_usrsctp_cbctx)
+        return errno ? errno : ENOMEM;
+
     sock = usrsctp_socket(family, SOCK_STREAM, IPPROTO_SCTP,
-                          NULL, NULL, 0, NULL);
-    if (!sock)
-        return errno ? errno : EIO;
+                          NULL, NULL, 0,
+                          NULL);
+    if (!sock) {
+        ret = errno ? errno : EIO;
+        fd_usrsctp_cbctx_free(conn->cc_usrsctp_cbctx);
+        conn->cc_usrsctp_cbctx = NULL;
+        return ret;
+    }
 
     conn->cc_transport.type = FD_CNX_TRANSPORT_USRSCTP;
     conn->cc_transport.endpoint.usrsctp = sock;
 
-    if (usrsctp_setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+    if (usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_REUSE_PORT,
                            &reuse, sizeof(reuse)) < 0) {
         ret = errno;
         goto fail;
@@ -152,6 +507,8 @@ fail:
     free(addresses);
     usrsctp_close(sock);
     conn->cc_transport.endpoint.usrsctp = NULL;
+    fd_usrsctp_cbctx_free(conn->cc_usrsctp_cbctx);
+    conn->cc_usrsctp_cbctx = NULL;
     return ret;
 }
 
@@ -204,6 +561,13 @@ static int fd_usrsctp_accept(struct cnxctx *listener, struct cnxctx *accepted)
 	char peer_host[NI_MAXHOST];
 	char peer_service[NI_MAXSERV];
 
+	accepted->cc_usrsctp_cbctx = fd_usrsctp_cbctx_new(accepted);
+	if (!accepted->cc_usrsctp_cbctx) {
+		ret = errno ? errno : ENOMEM;
+		usrsctp_close(new_socket);
+		accepted->cc_transport.endpoint.usrsctp = NULL;
+		return ret;
+	}
 	ret = getnameinfo(
 		(struct sockaddr *)&peer_addr,
 		peer_len,
@@ -214,29 +578,11 @@ static int fd_usrsctp_accept(struct cnxctx *listener, struct cnxctx *accepted)
 	if (ret != 0) {
 		usrsctp_close(new_socket);
 		accepted->cc_transport.endpoint.usrsctp = NULL;
+		fd_usrsctp_cbctx_free(accepted->cc_usrsctp_cbctx);
+		accepted->cc_usrsctp_cbctx = NULL;
 		return EINVAL;
 	}
 
-	/* Zistenie počtu SCTP streamov. */
-	ret = fd_usrsctp_get_str_info(
-		new_socket,
-		&accepted->cc_sctp_para.str_in,
-		&accepted->cc_sctp_para.str_out);
-
-	if (ret != 0) {
-		usrsctp_close(new_socket);
-		accepted->cc_transport.endpoint.usrsctp = NULL;
-		return ret;
-	}
-
-	if (accepted->cc_sctp_para.str_out <
-		accepted->cc_sctp_para.str_in) {
-		accepted->cc_sctp_para.pairs =
-			accepted->cc_sctp_para.str_out;
-	} else {
-		accepted->cc_sctp_para.pairs =
-			accepted->cc_sctp_para.str_in;
-	}
     return 0;
 }
 
@@ -268,14 +614,24 @@ static int fd_usrsctp_connect(struct cnxctx *conn,
     conn->cc_family = family;
     conn->cc_proto = IPPROTO_SCTP;
 
+    fd_usrsctp_ensure_init();
+    conn->cc_usrsctp_cbctx = fd_usrsctp_cbctx_new(conn);
+    if (!conn->cc_usrsctp_cbctx)
+        return errno ? errno : ENOMEM;
+
     sock = usrsctp_socket(family, SOCK_STREAM, IPPROTO_SCTP,
-                          NULL, NULL, 0, NULL);
-    if (!sock)
-        return errno ? errno : EIO;
+                          NULL, NULL, 0,
+                          NULL);
+    if (!sock) {
+        ret = errno ? errno : EIO;
+        fd_usrsctp_cbctx_free(conn->cc_usrsctp_cbctx);
+        conn->cc_usrsctp_cbctx = NULL;
+        return ret;
+    }
 
     conn->cc_transport.endpoint.usrsctp = sock;
 
-    if (usrsctp_setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+    if (usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_REUSE_PORT,
                            &reuse, sizeof(reuse)) < 0) {
         ret = errno;
         goto fail;
@@ -336,16 +692,6 @@ static int fd_usrsctp_connect(struct cnxctx *conn,
         goto fail;
     }
 
-    ret = fd_usrsctp_get_str_info(sock,
-                                  &conn->cc_sctp_para.str_in,
-                                  &conn->cc_sctp_para.str_out);
-    if (ret)
-        goto fail;
-
-    conn->cc_sctp_para.pairs =
-        conn->cc_sctp_para.str_in < conn->cc_sctp_para.str_out
-            ? conn->cc_sctp_para.str_in
-            : conn->cc_sctp_para.str_out;
 
     /* Use the first peer address to populate the remote ID. */
     if (usrsctp_getpaddrs(sock, 0, &peer_addresses) < 0) {
@@ -382,37 +728,71 @@ fail:
     if (sock)
         usrsctp_close(sock);
     conn->cc_transport.endpoint.usrsctp = NULL;
+    fd_usrsctp_cbctx_free(conn->cc_usrsctp_cbctx);
+    conn->cc_usrsctp_cbctx = NULL;
     return ret;
 }
 
 static int fd_usrsctp_start_clear(struct cnxctx *conn, int loop)
 {
-	(void)conn;
+	struct fd_usrsctp_cbctx *ctx;
+	int ret;
+
 	(void)loop;
-	return ENOTSUP;
+	if (!conn || conn->cc_transport.type != FD_CNX_TRANSPORT_USRSCTP ||
+	    !conn->cc_transport.endpoint.usrsctp || !fd_cnx_target_queue(conn))
+		return EINVAL;
+	ctx = conn->cc_usrsctp_cbctx;
+	if (!ctx)
+		return EINVAL;
+	if (ctx->reader_started)
+		return 0;
+
+	/* The reader thread relies on blocking usrsctp_recvv() calls. */
+	if (usrsctp_set_non_blocking(conn->cc_transport.endpoint.usrsctp, 0) < 0)
+		return errno ? errno : EIO;
+
+	ret = pthread_create(&ctx->reader, NULL, fd_usrsctp_reader, conn);
+	if (ret)
+		return ret;
+	ctx->reader_started = 1;
+	return 0;
 }
 
 static ssize_t fd_usrsctp_recv(struct cnxctx *conn, void *buffer, size_t length)
 {
-	(void)conn;
-	(void)buffer;
-	(void)length;
-	errno = ENOTSUP;
-	return -1;
-}
+	struct fd_usrsctp_cbctx *ctx;
+	struct fd_usrsctp_data *queued;
+	size_t copy_len;
 
-static int fd_usrsctp_recv_meta(struct cnxctx *conn,
-                                uint16_t *stream,
-                                uint8_t **buffer,
-                                size_t *length,
-                                int *event)
-{
-	(void)conn;
-	(void)stream;
-	(void)buffer;
-	(void)length;
-	(void)event;
-	return ENOTSUP;
+	if (!conn || !buffer || !length || !(ctx = conn->cc_usrsctp_cbctx)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	pthread_mutex_lock(&ctx->lock);
+	while (!ctx->data_head && !ctx->closing)
+		pthread_cond_wait(&ctx->idle, &ctx->lock);
+	if (!ctx->data_head) {
+		pthread_mutex_unlock(&ctx->lock);
+		return 0;
+	}
+
+	queued = ctx->data_head;
+	copy_len = queued->length - queued->offset;
+	if (copy_len > length)
+		copy_len = length;
+	memcpy(buffer, queued->buffer + queued->offset, copy_len);
+	queued->offset += copy_len;
+	if (queued->offset == queued->length) {
+		ctx->data_head = queued->next;
+		if (!ctx->data_head)
+			ctx->data_tail = NULL;
+		free(queued->buffer);
+		free(queued);
+	}
+	pthread_mutex_unlock(&ctx->lock);
+	return (ssize_t)copy_len;
 }
 
 static ssize_t fd_usrsctp_send(struct cnxctx *conn,
@@ -462,26 +842,74 @@ static ssize_t fd_usrsctp_send(struct cnxctx *conn,
     return ret;
 }
 
-static int fd_usrsctp_get_streams(struct cnxctx *conn,
-                                  uint16_t *in,
-                                  uint16_t *out)
-{
-	(void)conn;
-	(void)in;
-	(void)out;
-	return ENOTSUP;
-}
-
 static int fd_usrsctp_get_remote_eps(struct cnxctx *conn, struct fd_list *eps)
 {
-	(void)conn;
-	(void)eps;
-	return ENOTSUP;
+	struct sockaddr *addresses = NULL;
+	int count, i, ret = 0;
+	uint8_t *cursor;
+
+	if (!conn || !eps ||
+	    conn->cc_transport.type != FD_CNX_TRANSPORT_USRSCTP ||
+	    !conn->cc_transport.endpoint.usrsctp)
+		return EINVAL;
+
+	count = usrsctp_getpaddrs(conn->cc_transport.endpoint.usrsctp, 0,
+	                          &addresses);
+	if (count < 0)
+		return errno ? errno : EIO;
+	cursor = (uint8_t *)addresses;
+	for (i = 0; i < count; i++) {
+		struct sockaddr *sa = (struct sockaddr *)cursor;
+		socklen_t length;
+		switch (sa->sa_family) {
+		case AF_INET:
+			length = sizeof(struct sockaddr_in);
+			break;
+		case AF_INET6:
+			length = sizeof(struct sockaddr_in6);
+			break;
+		default:
+			LOG_E("usrsctp_getpaddrs returned unsupported address family %d",
+			      sa->sa_family);
+			ret = EAFNOSUPPORT;
+			goto done;
+		}
+		ret = fd_ep_add_merge(eps, sa, length, EP_FL_LL);
+		if (ret)
+			goto done;
+		cursor += length;
+	}
+
+done:
+	if (addresses)
+		usrsctp_freepaddrs(addresses);
+	return ret;
 }
 
 static void fd_usrsctp_close(struct cnxctx *conn)
 {
-	(void)conn;
+	struct fd_usrsctp_cbctx *ctx;
+	struct socket *sock;
+
+	if (!conn)
+		return;
+	ctx = conn->cc_usrsctp_cbctx;
+	sock = conn->cc_transport.endpoint.usrsctp;
+	conn->cc_transport.endpoint.usrsctp = NULL;
+
+	if (ctx) {
+		pthread_mutex_lock(&ctx->lock);
+		ctx->closing = 1;
+		pthread_mutex_unlock(&ctx->lock);
+	}
+	if (sock)
+		usrsctp_close(sock);
+	if (ctx && ctx->reader_started &&
+	    !pthread_equal(pthread_self(), ctx->reader))
+		pthread_join(ctx->reader, NULL);
+
+	fd_usrsctp_cbctx_free(ctx);
+	conn->cc_usrsctp_cbctx = NULL;
 }
 
 static int fd_usrsctp_get_str_info(
@@ -620,6 +1048,16 @@ static int fd_usrsctp_append_endpoint_pass(uint8_t **buffer,
     return 0;
 }
 
+static int fd_usrsctp_get_streams(struct cnxctx *conn,
+                                   uint16_t *in,
+                                   uint16_t *out)
+{
+	if (!conn || conn->cc_transport.type != FD_CNX_TRANSPORT_USRSCTP ||
+	    !conn->cc_transport.endpoint.usrsctp)
+		return EINVAL;
+	return fd_usrsctp_get_str_info(conn->cc_transport.endpoint.usrsctp, in, out);
+}
+
 const struct fd_cnx_transport_ops fd_usrsctp_ops = {
 	.create_server = fd_usrsctp_create_server,
 	.listen = fd_usrsctp_listen,
@@ -627,7 +1065,6 @@ const struct fd_cnx_transport_ops fd_usrsctp_ops = {
 	.connect = fd_usrsctp_connect,
 	.start_clear = fd_usrsctp_start_clear,
 	.recv = fd_usrsctp_recv,
-	.recv_meta = fd_usrsctp_recv_meta,
 	.send = fd_usrsctp_send,
 	.get_streams = fd_usrsctp_get_streams,
 	.get_remote_eps = fd_usrsctp_get_remote_eps,

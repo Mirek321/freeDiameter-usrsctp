@@ -300,6 +300,13 @@ struct cnxctx * fd_cnx_serv_accept(struct cnxctx * serv)
 			fd_cnx_destroy(cli);
 			return NULL;
 		});
+		CHECK_FCT_DO(cli->cc_transport.ops->get_streams(cli, &cli->cc_sctp_para.str_in,
+		                                             &cli->cc_sctp_para.str_out), {
+			fd_cnx_destroy(cli);
+			return NULL;
+		});
+		cli->cc_sctp_para.pairs = cli->cc_sctp_para.str_out < cli->cc_sctp_para.str_in
+			? cli->cc_sctp_para.str_out : cli->cc_sctp_para.str_in;
 		LOG_D("Incoming userspace SCTP connection: '%s'", fd_cnx_getid(cli));
 		LOG_A("%s : client '%s' (SCTP:%d, %d/%d streams)",
 		      fd_cnx_getid(serv), fd_cnx_getid(cli), -1,
@@ -458,6 +465,10 @@ struct cnxctx * fd_cnx_cli_connect_sctp(int no_ip6, uint16_t port, struct fd_lis
 		cnx->cc_transport.ops = &fd_usrsctp_ops;
 		CHECK_FCT_DO(cnx->cc_transport.ops->connect(cnx, no_ip6, port, list, src_list),
 		             goto error);
+		CHECK_FCT_DO(cnx->cc_transport.ops->get_streams(cnx, &cnx->cc_sctp_para.str_in,
+		                                              &cnx->cc_sctp_para.str_out), goto error);
+		cnx->cc_sctp_para.pairs = cnx->cc_sctp_para.str_out < cnx->cc_sctp_para.str_in
+			? cnx->cc_sctp_para.str_out : cnx->cc_sctp_para.str_in;
 		snprintf(cnx->cc_id, sizeof(cnx->cc_id),
 		         CC_ID_HDR "SCTP -> %s (usrsctp)", sa_buf);
 		LOG_A("SCTP connection to %s succeeded (usrsctp, %d/%d streams).",
@@ -1707,7 +1718,16 @@ int fd_cnx_receive(struct cnxctx * conn, struct timespec * timeout, unsigned cha
 
 	TRACE_ENTRY("%p %p %p %p", conn, timeout, buf, len);
 	CHECK_PARAMS(conn && fd_cnx_transport_valid(conn) && buf && len);
+#ifdef USE_USRSCTP
+	if (conn->cc_transport.type == FD_CNX_TRANSPORT_USRSCTP) {
+		/* usrsctp messages are delivered by the reader thread started in start_clear */
+		CHECK_PARAMS(conn->cc_usrsctp_cbctx && conn->cc_usrsctp_cbctx->reader_started);
+	} else {
+		CHECK_PARAMS(conn->cc_rcvthr != (pthread_t)NULL);
+	}
+#else
 	CHECK_PARAMS(conn->cc_rcvthr != (pthread_t)NULL);
+#endif
 	CHECK_PARAMS(conn->cc_alt == NULL);
 
 	/* Now, pull the first event */
