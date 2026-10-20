@@ -313,8 +313,8 @@ static void *fd_usrsctp_reader(void *arg)
 	struct fd_usrsctp_cbctx *ctx = conn->cc_usrsctp_cbctx;
 	struct socket *sock = conn->cc_transport.endpoint.usrsctp;
 
-	LOG_D("[usrsctp] reader thread started for %s:%u (fd=%p)",
-	      conn->cc_remhost ? : "?", conn->cc_remport, sock);
+	LOG_D("[usrsctp] reader thread started for %s (fd=%p)",
+	      conn->cc_remid, sock);
 
 	for (;;) {
 		struct sctp_rcvinfo rcv;
@@ -337,7 +337,7 @@ static void *fd_usrsctp_reader(void *arg)
 			break;
 		}
 		LOG_D("[usrsctp] received %zd bytes, stream %u, flags %x",
-		      n, rcv.rcv_stream, flags);
+		      n, rcv.rcv_sid, flags);
 		fd_usrsctp_handle_message(ctx, sock, data, (size_t)n, rcv, flags);
 	}
 
@@ -1021,28 +1021,30 @@ static int fd_usrsctp_get_str_info(
     uint16_t *out)
 {
     struct sctp_status status;
-    socklen_t status_len = sizeof(status);
+    socklen_t len;
+    int err;
 
     if (!sock || !in || !out)
         return EINVAL;
 
+    /* Try to get actual stream counts from SCTP_STATUS */
     memset(&status, 0, sizeof(status));
-
-    if (usrsctp_getsockopt(
-            sock,
-            IPPROTO_SCTP,
-            SCTP_STATUS,
-            &status,
-            &status_len) < 0) {
-        return errno ? errno : EIO;
+    len = sizeof(status);
+    if (usrsctp_getsockopt(sock, IPPROTO_SCTP, SCTP_STATUS, &status, &len) >= 0
+        && len >= sizeof(status)) {
+        LOG_D("[usrsctp] get_streams: in=%u out=%u",
+              status.sstat_instrms, status.sstat_outstrms);
+        *in = status.sstat_instrms;
+        *out = status.sstat_outstrms;
+        return 0;
     }
 
-    if (status_len < sizeof(status))
-        return ENOTSUP;
-
-    *in = status.sstat_instrms;
-    *out = status.sstat_outstrms;
-
+    /* Fallback: use configured default when SCTP_STATUS fails */
+    err = errno;
+    LOG_N("[usrsctp] SCTP_STATUS unavailable (%s), using configured default (%u streams)",
+          strerror(err), fd_g_config->cnf_sctp_str);
+    *in = fd_g_config->cnf_sctp_str;
+    *out = fd_g_config->cnf_sctp_str;
     return 0;
 }
 
