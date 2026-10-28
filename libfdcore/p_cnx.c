@@ -267,7 +267,7 @@ static void * connect_thr(void * arg)
 #ifndef DISABLE_SCTP			
 			case IPPROTO_SCTP:
 				cnx = fd_cnx_cli_connect_sctp((peer->p_hdr.info.config.pic_flags.pro3 == PI_P3_IP) ? 1 : fd_g_config->cnf_flags.no_ip6, 
-							nc->port, peer->p_hdr.info.config.pic_sctp_udp_port,
+							nc->port,
 							&peer->p_hdr.info.pi_endpoints,
 							fd_g_config->cnf_flags.no_bind ? NULL : &fd_g_config->cnf_endpoints);
 				break;

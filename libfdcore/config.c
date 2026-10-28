@@ -58,8 +58,6 @@ int fd_conf_init()
 	fd_g_config->cnf_port     = DIAMETER_PORT;
 	fd_g_config->cnf_port_tls = DIAMETER_SECURE_PORT;
 	fd_g_config->cnf_sctp_str = 30;
-	fd_g_config->cnf_sctp_udp_port = 9899;
-	fd_g_config->cnf_flags.sctp_udp_encap = 0;
 	fd_g_config->cnf_thr_srv  = 5;
 	fd_g_config->cnf_processing_peers_minimum = 0;
 	fd_g_config->cnf_dispthr  = 4;
@@ -106,9 +104,6 @@ DECLARE_FD_DUMP_PROTOTYPE(fd_conf_dump)
 	}
 	CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  Number of SCTP streams . : %hu\n", fd_g_config->cnf_sctp_str), return NULL);
 #ifdef USE_USRSCTP
-	CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  SCTP transport ......... : %s\n", fd_g_config->cnf_flags.sctp_udp_encap ? "UDP encapsulation" : "raw sockets"), return NULL);
-	if (fd_g_config->cnf_flags.sctp_udp_encap)
-		CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  SCTP/UDP encaps port ... : %hu\n", fd_g_config->cnf_sctp_udp_port), return NULL);
 #endif /* USE_USRSCTP */
 	CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  Number of clients thr .. : %d\n", fd_g_config->cnf_thr_srv), return NULL);
 	CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  Number of app threads .. : %hu\n", fd_g_config->cnf_dispthr), return NULL);

@@ -29,6 +29,7 @@ SET(TEST_LIST
 	testsess
 	testdisp
 	testcnx
+	testcnx_sctp
 	testloadext
 )
 
@@ -111,6 +112,7 @@ FOREACH( TEST ${TEST_LIST} )
 ENDFOREACH( TEST )
 
 
+#############################
 ####
 ## INSTALL section ##
 

@@ -419,9 +419,8 @@ struct cnxctx * fd_cnx_cli_connect_tcp(sSA * sa /* contains the port already */,
 }
 
 /* Same for SCTP, accepts a list of remote addresses to connect to (see sctp_connectx for how they are used).
- * If src_list is not NULL and not empty, list of local addresses to connect from via sctp_bindx().
- * udp_port is the peer's SCTP-over-UDP encapsulation port (usrsctp only, 0: default); the kernel backend ignores it. */
-struct cnxctx * fd_cnx_cli_connect_sctp(int no_ip6, uint16_t port, uint16_t udp_port, struct fd_list * list, struct fd_list * src_list)
+ * If src_list is not NULL and not empty, list of local addresses to connect from via sctp_bindx(). */
+struct cnxctx * fd_cnx_cli_connect_sctp(int no_ip6, uint16_t port, struct fd_list * list, struct fd_list * src_list)
 {
 #ifdef DISABLE_SCTP
 	TRACE_DEBUG(INFO, "This function should never be called when SCTP is disabled...");
@@ -464,7 +463,7 @@ struct cnxctx * fd_cnx_cli_connect_sctp(int no_ip6, uint16_t port, uint16_t udp_
 		CHECK_MALLOC_DO(cnx = fd_cnx_init(1), return NULL);
 		cnx->cc_transport.type = FD_CNX_TRANSPORT_USRSCTP;
 		cnx->cc_transport.ops = &fd_usrsctp_ops;
-		CHECK_FCT_DO(cnx->cc_transport.ops->connect(cnx, no_ip6, port, udp_port, list, src_list),
+		CHECK_FCT_DO(cnx->cc_transport.ops->connect(cnx, no_ip6, port, list, src_list),
 		             goto error);
 		CHECK_FCT_DO(cnx->cc_transport.ops->get_streams(cnx, &cnx->cc_sctp_para.str_in,
 		                                              &cnx->cc_sctp_para.str_out), goto error);

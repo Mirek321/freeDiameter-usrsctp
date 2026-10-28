@@ -1,7 +1,7 @@
-# Localhost userspace SCTP example
+# Localhost SCTP example
 
-This example connects two freeDiameter processes on one host using the bundled
-userspace SCTP backend and SCTP over UDP (RFC 6951). The server listens on
+This example connects two freeDiameter processes on one host using SCTP. The
+server listens on
 `127.0.0.1:3868`; the client listens on `127.0.0.1:3869` and initiates the
 connection. Both load `test_app`. TCP and IPv6 are disabled, and the peer
 connection uses `No_TLS`.
@@ -10,12 +10,22 @@ Run the commands below from the repository root.
 
 ## Build and create a local certificate
 
-Configure the userspace backend and enable `test_app`:
+Configure the userspace backend and enable `test_app`. The userspace backend
+uses raw SCTP sockets, which may require `CAP_NET_RAW`:
 
 ```sh
 cmake -S . -B build-usrsctp -DUSE_USRSCTP=ON -DBUILD_TEST_APP=ON
 cmake --build build-usrsctp -j
 ```
+
+Grant the daemon binary permission to open raw sockets, or run it as root:
+
+```sh
+sudo setcap cap_net_raw+ep ./build-usrsctp/freeDiameterd/freeDiameterd
+```
+
+Reapply `setcap` after rebuilding the binary. If `setcap` is unavailable, start
+each daemon command below with `sudo` instead.
 
 The configuration parser still requires `TLS_Cred` and `TLS_CA` entries even
 though this example disables TLS for the peer connection. Create a self-signed
@@ -44,17 +54,6 @@ Then start the client in the other terminal:
 
 ```sh
 ./build-usrsctp/freeDiameterd/freeDiameterd -c doc/localhost/client.conf
-```
-
-The configs assign UDP encapsulation port `9899` to the server and `9900` to
-the client. Each peer's `ConnectPeer` block points to the other's UDP port. If a
-port is already in use, choose free ports consistently in both configs; a bind
-failure is reported as `cannot bind UDP encapsulation port`.
-
-Capture SCTP-over-UDP traffic on the loopback interface with:
-
-```sh
-sudo tcpdump -ni lo -s0 -vvv -XX 'udp port 9899 or udp port 9900'
 ```
 
 ## Peer connection test

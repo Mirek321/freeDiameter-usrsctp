@@ -51,6 +51,14 @@ static struct fd_usrsctp_cbctx *fd_usrsctp_cbctx_new(struct cnxctx *conn)
 		errno = ret;
 		return NULL;
 	}
+	ret = pthread_cond_init(&ctx->acceptable, NULL);
+	if (ret) {
+		pthread_cond_destroy(&ctx->idle);
+		pthread_mutex_destroy(&ctx->lock);
+		free(ctx);
+		errno = ret;
+		return NULL;
+	}
 	ctx->conn = conn;
 	return ctx;
 }
@@ -79,6 +87,7 @@ static void fd_usrsctp_cbctx_free(struct fd_usrsctp_cbctx *ctx)
 		free(queued->buffer);
 		free(queued);
 	}
+	pthread_cond_destroy(&ctx->acceptable);
 	pthread_cond_destroy(&ctx->idle);
 	pthread_mutex_destroy(&ctx->lock);
 	free(ctx);
@@ -317,7 +326,7 @@ static void *fd_usrsctp_reader(void *arg)
 	      conn->cc_remid, sock);
 
 	for (;;) {
-		struct sctp_rcvinfo rcv;
+		struct sctp_rcvinfo rcv = { 0 };
 		socklen_t infolen = sizeof(rcv);
 		unsigned int infotype = SCTP_RECVV_RCVINFO;
 		int flags = 0;
@@ -328,6 +337,8 @@ static void *fd_usrsctp_reader(void *arg)
 		n = data ? usrsctp_recvv(sock, data, FD_USRSCTP_MAX_MESSAGE,
 		                         NULL, NULL, &rcv, &infolen, &infotype,
 		                         &flags) : -1;
+		if (n > 0 && infotype != SCTP_RECVV_RCVINFO)
+			memset(&rcv, 0, sizeof(rcv));
 		if (n <= 0) {
 			if (n < 0)
 				LOG_D("[usrsctp] read error: %s", strerror(errno));
@@ -365,7 +376,7 @@ static int fd_usrsctp_live_sockets = 0;
 static void fd_usrsctp_global_init(void)
 {
 	LOG_N("[usrsctp] initializing library");
-	usrsctp_init(9899, NULL, NULL);
+	usrsctp_init(0, NULL, NULL);
 	fd_usrsctp_initialized = 1;
 	LOG_N("[usrsctp] library initialized");
 }
@@ -373,6 +384,17 @@ static void fd_usrsctp_global_init(void)
 static void fd_usrsctp_ensure_init(void)
 {
 	pthread_once(&fd_usrsctp_once, fd_usrsctp_global_init);
+}
+
+/* Ask for a struct sctp_rcvinfo with each message: the reader reassembles on its stream/ssn. */
+static int fd_usrsctp_set_recvrcvinfo(struct socket *sock)
+{
+	int on = 1;
+
+	if (usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_RECVRCVINFO,
+	                       &on, sizeof(on)) < 0)
+		return errno;
+	return 0;
 }
 
 static void fd_usrsctp_socket_inc(void)
@@ -465,18 +487,9 @@ static int fd_usrsctp_create_server(struct cnxctx *conn,
         goto fail;
     }
 
-    {
-        struct sctp_udpencaps encaps;
-        memset(&encaps, 0, sizeof(encaps));
-        encaps.sue_port = htons(9899);
-        encaps.sue_assoc_id = SCTP_FUTURE_ASSOC;
-        if (usrsctp_setsockopt(sock, IPPROTO_SCTP,
-                               SCTP_REMOTE_UDP_ENCAPS_PORT,
-                               &encaps, sizeof(encaps)) < 0) {
-            ret = errno;
-            goto fail;
-        }
-    }
+    ret = fd_usrsctp_set_recvrcvinfo(sock);
+    if (ret)
+        goto fail;
 
     /* Count configured endpoints to size the packed bindx address list. */
     if (endpoints) {
@@ -592,19 +605,80 @@ fail:
     return ret;
 }
 
+/* Read upcall of a listening socket: a new association is ready to be accepted.
+ * Runs in a usrsctp thread, so only signal the waiting accept. */
+static void fd_usrsctp_accept_upcall(struct socket *sock, void *arg, int flags)
+{
+	struct fd_usrsctp_cbctx *ctx = arg;
+
+	pthread_mutex_lock(&ctx->lock);
+	ctx->accept_events++;
+	pthread_cond_broadcast(&ctx->acceptable);
+	pthread_mutex_unlock(&ctx->lock);
+}
+
 static int fd_usrsctp_listen(struct cnxctx *conn, int backlog)
 {
+    struct socket *sock;
+
     TRACE_ENTRY("%p %d", conn, backlog);
 
     CHECK_PARAMS(conn);
     CHECK_PARAMS(conn->cc_transport.endpoint.usrsctp);
+    CHECK_PARAMS(conn->cc_usrsctp_cbctx);
+    sock = conn->cc_transport.endpoint.usrsctp;
 
-    CHECK_SYS(usrsctp_listen(
-        conn->cc_transport.endpoint.usrsctp,
-        backlog
-    ));
+    /* The listener is non-blocking and accept waits on our own condition variable (see
+     * fd_usrsctp_accept): the server thread is stopped with pthread_cancel, and cancelling
+     * it inside a blocking usrsctp_accept() leaves usrsctp's accept lock held, which then
+     * deadlocks usrsctp_close() on the listener. */
+    CHECK_SYS(usrsctp_set_non_blocking(sock, 1));
+    CHECK_SYS(usrsctp_set_upcall(sock, fd_usrsctp_accept_upcall, conn->cc_usrsctp_cbctx));
+    CHECK_SYS(usrsctp_listen(sock, backlog));
 
     return 0;
+}
+
+static void fd_usrsctp_unlock_cleanup(void *arg)
+{
+	pthread_mutex_unlock(arg);
+}
+
+/* Accept one association; blocks until there is one. This is a cancellation point. */
+static struct socket *fd_usrsctp_accept_wait(struct fd_usrsctp_cbctx *ctx,
+                                             struct socket *listener,
+                                             struct sockaddr *addr,
+                                             socklen_t *addrlen)
+{
+	for (;;) {
+		struct socket *new_socket;
+		socklen_t len = *addrlen;
+		int closing;
+
+		/* Reset before trying, so an upcall arriving after a failed attempt is not lost. */
+		pthread_mutex_lock(&ctx->lock);
+		ctx->accept_events = 0;
+		pthread_mutex_unlock(&ctx->lock);
+
+		new_socket = usrsctp_accept(listener, addr, &len);
+		if (new_socket) {
+			*addrlen = len;
+			return new_socket;
+		}
+		if (errno != EWOULDBLOCK && errno != EAGAIN)
+			return NULL;
+
+		pthread_mutex_lock(&ctx->lock);
+		pthread_cleanup_push(fd_usrsctp_unlock_cleanup, &ctx->lock);
+		while (!ctx->accept_events && !ctx->closing)
+			pthread_cond_wait(&ctx->acceptable, &ctx->lock);
+		closing = ctx->closing;
+		pthread_cleanup_pop(1);
+		if (closing) {
+			errno = EBADF;
+			return NULL;
+		}
+	}
 }
 
 static int fd_usrsctp_accept(struct cnxctx *listener, struct cnxctx *accepted)
@@ -617,17 +691,25 @@ static int fd_usrsctp_accept(struct cnxctx *listener, struct cnxctx *accepted)
     CHECK_PARAMS(accepted != NULL);
     CHECK_PARAMS(listener->cc_transport.type ==
                  FD_CNX_TRANSPORT_USRSCTP);
+    CHECK_PARAMS(listener->cc_usrsctp_cbctx);
 
     memset(&peer_addr, 0, sizeof(peer_addr));
 
-    new_socket = usrsctp_accept(
+    errno = 0;
+    new_socket = fd_usrsctp_accept_wait(
+        listener->cc_usrsctp_cbctx,
         listener->cc_transport.endpoint.usrsctp,
         (struct sockaddr *)&peer_addr,
         &peer_len);
 
-    if (new_socket == NULL) {
-        /* Prispôsob error handlingu projektu. */
+    if (new_socket == NULL)
         return errno ? errno : EIO;
+
+    /* Accepted sockets inherit non-blocking mode; the reader thread needs blocking reads. */
+    if (usrsctp_set_non_blocking(new_socket, 0) < 0) {
+        int ret = errno;
+        usrsctp_close(new_socket);
+        return ret;
     }
 
     accepted->cc_transport.type = FD_CNX_TRANSPORT_USRSCTP;
@@ -728,18 +810,9 @@ static int fd_usrsctp_connect(struct cnxctx *conn,
         goto fail;
     }
 
-    {
-        struct sctp_udpencaps encaps;
-        memset(&encaps, 0, sizeof(encaps));
-        encaps.sue_port = htons(9899);
-        encaps.sue_assoc_id = SCTP_FUTURE_ASSOC;
-        if (usrsctp_setsockopt(sock, IPPROTO_SCTP,
-                               SCTP_REMOTE_UDP_ENCAPS_PORT,
-                               &encaps, sizeof(encaps)) < 0) {
-            ret = errno;
-            goto fail;
-        }
-    }
+    ret = fd_usrsctp_set_recvrcvinfo(sock);
+    if (ret)
+        goto fail;
 
     /* Bind only configured source addresses; port 0 lets usrsctp choose a port. */
     if (local && !FD_IS_LIST_EMPTY(local)) {
@@ -759,19 +832,19 @@ static int fd_usrsctp_connect(struct cnxctx *conn,
 
     /* Try configured, discovered, then other remote addresses, as fd_sctp_client does. */
     ret = fd_usrsctp_append_endpoint_pass(
-        &remote_addresses, &remote_length, family, remote, htons(port),
+        &remote_addresses, &remote_length, family, remote, port,
         EP_FL_CONF, EP_FL_CONF, &remote_count);
     if (ret)
         goto fail;
 
     ret = fd_usrsctp_append_endpoint_pass(
-        &remote_addresses, &remote_length, family, remote, htons(port),
+        &remote_addresses, &remote_length, family, remote, port,
         EP_FL_CONF | EP_FL_DISC, EP_FL_DISC, &remote_count);
     if (ret)
         goto fail;
 
     ret = fd_usrsctp_append_endpoint_pass(
-        &remote_addresses, &remote_length, family, remote, htons(port),
+        &remote_addresses, &remote_length, family, remote, port,
         EP_FL_CONF | EP_FL_DISC, 0, &remote_count);
     if (ret)
         goto fail;
@@ -786,7 +859,6 @@ static int fd_usrsctp_connect(struct cnxctx *conn,
         ret = errno;
         goto fail;
     }
-
 
     /* Use the first peer address to populate the remote ID. */
     if (usrsctp_getpaddrs(sock, 0, &peer_addresses) < 0) {
@@ -1000,16 +1072,25 @@ static void fd_usrsctp_close(struct cnxctx *conn)
 	if (ctx) {
 		pthread_mutex_lock(&ctx->lock);
 		ctx->closing = 1;
+		pthread_cond_broadcast(&ctx->acceptable);
 		pthread_mutex_unlock(&ctx->lock);
 	}
+	/* No more accept upcalls into ctx once it is freed below. */
+	if (sock)
+		usrsctp_set_upcall(sock, NULL, NULL);
+	/* usrsctp_close() does not wake a reader blocked in usrsctp_recvv() and frees the
+	 * socket under it: shut the socket down first (this wakes the reader with EOF),
+	 * join the reader, and only then close. */
+	if (sock)
+		usrsctp_shutdown(sock, SHUT_RDWR);
+	if (ctx && ctx->reader_started &&
+	    !pthread_equal(pthread_self(), ctx->reader))
+		pthread_join(ctx->reader, NULL);
 	if (sock) {
 		LOG_D("[usrsctp] closing socket %p", sock);
 		usrsctp_close(sock);
 		fd_usrsctp_socket_dec();
 	}
-	if (ctx && ctx->reader_started &&
-	    !pthread_equal(pthread_self(), ctx->reader))
-		pthread_join(ctx->reader, NULL);
 
 	fd_usrsctp_cbctx_free(ctx);
 	conn->cc_usrsctp_cbctx = NULL;

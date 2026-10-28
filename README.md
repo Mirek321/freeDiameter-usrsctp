@@ -47,10 +47,10 @@ The `manage.sh` helper performs the same configure, build, and test steps:
 ./manage.sh rebuild all
 ```
 
-The userspace backend supports SCTP over UDP (RFC 6951). Set
-`SCTP_Transport = "UDP"` and, when needed, `SCTP_UDP_Port` in the daemon or
-peer configuration. See [doc/freediameter.conf.sample](doc/freediameter.conf.sample)
-for configuration options.
+The userspace SCTP backend uses raw SCTP sockets, which may require permission
+to open raw sockets (typically `CAP_NET_RAW`). See
+[doc/freediameter.conf.sample](doc/freediameter.conf.sample) for configuration
+options.
 
 ## Localhost SCTP example
 

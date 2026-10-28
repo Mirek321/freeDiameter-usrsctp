@@ -93,15 +93,8 @@ gets a reader thread, started from `start_clear`, that blocks in `usrsctp_recvv(
   `SCTP_RECVRCVINFO` is enabled so `rcvinfo` (stream/ssn used for reassembly) is valid.
 - Stream counts come from the `get_streams` op (backed by `fd_usrsctp_get_str_info`). The
   accept and connect paths in `cnxctx.c` call it and derive `pairs`, as the kernel path does.
-- All usrsctp traffic is SCTP over UDP (RFC 6951). `fd_usrsctp_ensure_init()` probes, then
-  passes the local `SCTP_UDP_Port` (`cnf_sctp_udp_port`, default 9899) to `usrsctp_init()`,
-  once, before the first socket; if the port is taken it fails every SCTP connection, because
-  usrsctp itself only logs a failed bind. The remote port is per peer (`SCTP_UDP_Port` in
-  `ConnectPeer`, `pic_sctp_udp_port`, passed through `fd_cnx_cli_connect_sctp`) and set with
-  `SCTP_REMOTE_UDP_ENCAPS_PORT` on connect only. Accepted associations reply to the UDP source
-  port the peer used. Two daemons on one host need distinct ports (see `doc/localhost/`).
-- `usrsctp_connectx()` only sends the INIT, so `fd_usrsctp_connect` polls `SCTP_STATUS` until
-  `SCTP_ESTABLISHED` (or refusal, or `CNX_TIMEOUT`).
+- The usrsctp backend uses raw SCTP sockets (`usrsctp_init(0, ...)`); opening raw sockets may
+  require `CAP_NET_RAW`.
 - The listener is non-blocking with a read upcall, and accept waits on `acceptable` in the
   cbctx. Never block in `usrsctp_accept()`: the server thread is stopped with `pthread_cancel`,
   which would leave usrsctp's accept lock held and deadlock `usrsctp_close()`. Accepted sockets

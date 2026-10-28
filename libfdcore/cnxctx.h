@@ -54,7 +54,6 @@ struct fd_cnx_transport_ops {
 	int (*connect)(struct cnxctx *conn,
 	               int no_ip6,
 	               uint16_t port,
-	               uint16_t udp_port,
 	               struct fd_list *remote,
 	               struct fd_list *local);
 	int (*start_clear)(struct cnxctx *conn, int loop);
