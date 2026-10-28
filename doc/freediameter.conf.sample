@@ -61,6 +61,20 @@
 # Default : 30 streams
 #SCTP_streams = 30;
 
+# Select the transport used by the usrsctp backend.
+# Only valid when freeDiameter is built with USE_USRSCTP. UDP encapsulation
+# avoids raw sockets and CAP_NET_RAW; RAW sends SCTP directly over IP and
+# requires permission to open raw sockets (typically CAP_NET_RAW).
+# Default : UDP encapsulation
+#SCTP_Transport = "UDP"; # or "RAW"
+
+# Local UDP port for SCTP over UDP encapsulation (RFC 6951).
+# Used only with SCTP_Transport = "UDP". Each process on a host needs its own
+# port. Incoming associations are answered on the UDP port they come from.
+# The remote peer's UDP port can be set with SCTP_UDP_Port in its ConnectPeer block.
+# Default : 9899 (IANA sctp-tunneling)
+#SCTP_UDP_Port = 9899;
+
 ##############################################################
 ##  Endpoint configuration
 
@@ -274,6 +288,7 @@ TLS_Cred = "/etc/ssl/certs/freeDiameter.pem", "/etc/ssl/private/freeDiameter.key
 #  No_TCP; No_SCTP; No_IP; No_IPv6; Prefer_TCP; TLS_old_method;
 #  No_TLS;       # assume transparent security instead of TLS. DTLS is not supported yet (will change in future versions).
 #  Port = 5868;  # The port to connect to
+#  SCTP_UDP_Port = 9899; # USE_USRSCTP + SCTP_Transport="UDP": peer encapsulation port (default 9899)
 #  TcTimer = 30;
 #  TwTimer = 30;
 #  ConnectTo = "202.249.37.5";

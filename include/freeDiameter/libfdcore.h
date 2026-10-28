@@ -133,6 +133,7 @@ struct fd_config {
 	uint16_t	 cnf_port_tls;	/* the local port for Diameter/TLS (default: 5868) in host byte order */
 	uint16_t	 cnf_port_3436; /* Open an additional server port to listen to old TLS/SCTP clients (RFC3436, freeDiameter versions < 1.2.0) */
 	uint16_t	 cnf_sctp_str;	/* default max number of streams for SCTP associations (def: 30) */
+	uint16_t	 cnf_sctp_udp_port; /* usrsctp only: local SCTP-over-UDP encapsulation port, RFC 6951 (def: 9899; used with SCTP_Transport UDP) */
 	struct fd_list	 cnf_endpoints;	/* the local endpoints to bind the server to. list of struct fd_endpoint. default is empty (bind all). After servers are started, this is the actual list of endpoints including port information. */
 	int		 cnf_thr_srv;	/* Number of threads per servers handling the connection state machines */
 	int		 cnf_processing_peers_minimum;	/* Number of processing peers that must be connected before other peers may connect */
@@ -154,6 +155,7 @@ struct fd_config {
 		unsigned pr_tcp	: 1;	/* prefer TCP over SCTP */
 		unsigned tls_alg: 1;	/* TLS algorithm for initiated cnx. 0: separate port. 1: inband-security (old) */
 		unsigned no_bind: 1;	/* disable client bind to cnf_endpoints if non configured (bind all) */
+		unsigned sctp_udp_encap: 1;	/* use SCTP over UDP with usrsctp (default); otherwise use raw SCTP sockets */
 	} 		 cnf_flags;
 	
 	struct {
@@ -290,6 +292,7 @@ struct peer_info {
 		
 		DiamId_t	pic_realm;	/* If configured, the daemon will check the received realm in CER/CEA matches this. */
 		uint16_t	pic_port; 	/* port to connect to. 0: default. */
+		uint16_t	pic_sctp_udp_port; /* usrsctp only: peer UDP encapsulation port; 0: default (9899), requires SCTP_Transport UDP */
 		
 		uint32_t 	pic_lft;	/* lifetime of this peer when inactive (see pic_flags.exp definition) */
 		int		pic_tctimer; 	/* use this value for TcTimer instead of global, if != 0 */

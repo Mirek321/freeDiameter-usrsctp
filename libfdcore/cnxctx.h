@@ -54,6 +54,7 @@ struct fd_cnx_transport_ops {
 	int (*connect)(struct cnxctx *conn,
 	               int no_ip6,
 	               uint16_t port,
+	               uint16_t udp_port,
 	               struct fd_list *remote,
 	               struct fd_list *local);
 	int (*start_clear)(struct cnxctx *conn, int loop);
@@ -73,6 +74,7 @@ struct fd_cnx_transport_ops {
 
 #ifdef USE_USRSCTP
 extern const struct fd_cnx_transport_ops fd_usrsctp_ops;
+void fd_usrsctp_global_finish(void);
 #endif
 
 enum fd_cnx_transport_type {
@@ -119,6 +121,8 @@ struct fd_usrsctp_cbctx {
 	int closing;
 	pthread_t reader;
 	int reader_started;
+	pthread_cond_t acceptable;	/* listener: signalled by the read upcall */
+	unsigned int accept_events;	/* listener: upcalls since the last accept attempt */
 	struct fd_usrsctp_partial *partials;
 	struct fd_usrsctp_data *data_head;
 	struct fd_usrsctp_data *data_tail;

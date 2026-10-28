@@ -80,7 +80,7 @@ Rules that follow from this design:
 
 ### usrsctp backend design (`sctp_usrsctp.c`)
 
-usrsctp sockets are created without a receive upcall. Each accepted or connected socket
+Data sockets have no receive upcall (only the listener has one, for accept). Each accepted or connected socket
 gets a reader thread, started from `start_clear`, that blocks in `usrsctp_recvv()`:
 - `fd_usrsctp_reader` loops on `usrsctp_recvv()` and hands each message to
   `fd_usrsctp_handle_message()`, which does reassembly and posts `FDEVP_CNX_*` events or
@@ -88,19 +88,29 @@ gets a reader thread, started from `start_clear`, that blocks in `usrsctp_recvv(
 - Per-connection state is `struct fd_usrsctp_cbctx` (`cc_usrsctp_cbctx`): mutex, `closing`
   flag and `callback_refs` guard the handover to the reader, and `reader` / `reader_started`
   hold the thread.
-- `fd_usrsctp_close` sets `closing`, closes the socket (which wakes the reader), joins the
-  reader, then frees the context.
+- `fd_usrsctp_close` sets `closing`, calls `usrsctp_shutdown(SHUT_RDWR)` (which wakes the
+  reader; `usrsctp_close` does not), joins the reader, then closes and frees the context.
+  `SCTP_RECVRCVINFO` is enabled so `rcvinfo` (stream/ssn used for reassembly) is valid.
 - Stream counts come from the `get_streams` op (backed by `fd_usrsctp_get_str_info`). The
   accept and connect paths in `cnxctx.c` call it and derive `pairs`, as the kernel path does.
-- `fd_usrsctp_ensure_init()` calls `usrsctp_init(0, NULL, NULL)` once, before any usrsctp
-  socket is created (server and client paths).
-- With `conn_output == NULL` usrsctp sends and receives IP packets through raw sockets, which
-  need `CAP_NET_RAW`. Without it, associations never complete, so `testcnx`'s SCTP cases hang.
-  Run usrsctp-flavour tests only where raw sockets are allowed.
+- All usrsctp traffic is SCTP over UDP (RFC 6951). `fd_usrsctp_ensure_init()` probes, then
+  passes the local `SCTP_UDP_Port` (`cnf_sctp_udp_port`, default 9899) to `usrsctp_init()`,
+  once, before the first socket; if the port is taken it fails every SCTP connection, because
+  usrsctp itself only logs a failed bind. The remote port is per peer (`SCTP_UDP_Port` in
+  `ConnectPeer`, `pic_sctp_udp_port`, passed through `fd_cnx_cli_connect_sctp`) and set with
+  `SCTP_REMOTE_UDP_ENCAPS_PORT` on connect only. Accepted associations reply to the UDP source
+  port the peer used. Two daemons on one host need distinct ports (see `doc/localhost/`).
+- `usrsctp_connectx()` only sends the INIT, so `fd_usrsctp_connect` polls `SCTP_STATUS` until
+  `SCTP_ESTABLISHED` (or refusal, or `CNX_TIMEOUT`).
+- The listener is non-blocking with a read upcall, and accept waits on `acceptable` in the
+  cbctx. Never block in `usrsctp_accept()`: the server thread is stopped with `pthread_cancel`,
+  which would leave usrsctp's accept lock held and deadlock `usrsctp_close()`. Accepted sockets
+  inherit non-blocking mode and are switched back for the reader.
 
 Known gaps: TLS over usrsctp with multiple streams is not implemented – `sctp3436.c` and
 `rcvthr_notls_sctp` call `fd_sctp_sendstrv` / `fd_sctp_recvmeta` with the kernel fd; DTLS is
-a `TODO` in both backends.
+a `TODO` in both backends. So `testcnx` in the usrsctp flavour stops at its first RFC 3436 case
+(`testcnx.c` "old Diameter behavior", `ALGO_HANDSHAKE_3436`); the clear-text SCTP cases before it pass.
 
 ### Vendored `usrsctp/`
 

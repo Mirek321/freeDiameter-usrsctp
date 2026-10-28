@@ -34,6 +34,7 @@
 *********************************************************************************************************/
 
 #include "fdcore-internal.h"
+#include "cnxctx.h"
 
 GCC_DIAG_OFF("-Wdeprecated-declarations")
 #include <gcrypt.h>
@@ -101,7 +102,11 @@ static void core_shutdown(void)
 	CHECK_FCT_DO( fd_rtdisp_cleanstop(), /* Stop dispatch thread(s) after a clean loop if possible */ );
 	CHECK_FCT_DO( fd_peer_fini(), /* Stop all connections */ );
 	CHECK_FCT_DO( fd_rtdisp_fini(), /* Stop routing threads and destroy routing queues */ );
-	
+
+#ifdef USE_USRSCTP
+	fd_usrsctp_global_finish();
+#endif
+
 	CHECK_FCT_DO( fd_ext_term(), /* Cleanup all extensions */ );
 	CHECK_FCT_DO( fd_rtdisp_cleanup(), /* destroy remaining handlers */ );
 	

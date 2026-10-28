@@ -54,6 +54,7 @@
 %{
 #include "fdcore-internal.h"
 #include "fdd.tab.h"	/* bug : bison does not define the YYLTYPE before including this block, so... */
+#include <strings.h>
 
 /* The Lex parser prototype */
 int fddlex(YYSTYPE *lvalp, YYLTYPE *llocp);
@@ -106,6 +107,8 @@ struct peer_info fddpi;
 %token		OLDTLS
 %token		NOTLS
 %token		SCTPSTREAMS
+%token		SCTPUDPPORT
+%token		SCTPTRANSPORT
 %token		APPSERVTHREADS
 %token		ROUTINGINTHREADS
 %token		ROUTINGOUTTHREADS
@@ -146,6 +149,8 @@ conffile:		/* Empty is OK -- for simplicity here, we reject in daemon later */
 			| conffile secport
 			| conffile sec3436
 			| conffile sctpstreams
+			| conffile sctpudpport
+			| conffile sctptransport
 			| conffile listenon
 			| conffile thrpersrv
 			| conffile processingpeerspattern
@@ -240,6 +245,38 @@ sctpstreams:		SCTPSTREAMS '=' INTEGER ';'
 				CHECK_PARAMS_DO( ($3 > 0) && ($3 < 1<<16),
 					{ yyerror (&yylloc, conf, "Invalid value"); YYERROR; } );
 				conf->cnf_sctp_str = (uint16_t)$3;
+			}
+			;
+
+sctpudpport:		SCTPUDPPORT '=' INTEGER ';'
+			{
+				#ifndef USE_USRSCTP
+				yyerror (&yylloc, conf, "SCTP_UDP_Port requires a daemon compiled with the USE_USRSCTP option.");
+				YYERROR;
+				#endif /* USE_USRSCTP */
+				CHECK_PARAMS_DO( ($3 > 0) && ($3 < 1<<16),
+					{ yyerror (&yylloc, conf, "Invalid port value"); YYERROR; } );
+				conf->cnf_sctp_udp_port = (uint16_t)$3;
+			}
+			;
+
+sctptransport:		SCTPTRANSPORT '=' QSTRING ';'
+			{
+				#ifndef USE_USRSCTP
+				yyerror (&yylloc, conf, "SCTP_Transport requires a daemon compiled with the USE_USRSCTP option.");
+				free($3);
+				YYERROR;
+				#endif /* USE_USRSCTP */
+				if (!strcasecmp($3, "UDP"))
+					conf->cnf_flags.sctp_udp_encap = 1;
+				else if (!strcasecmp($3, "RAW"))
+					conf->cnf_flags.sctp_udp_encap = 0;
+				else {
+					yyerror (&yylloc, conf, "SCTP_Transport must be either \"UDP\" or \"RAW\".");
+					free($3);
+					YYERROR;
+				}
+				free($3);
 			}
 			;
 
@@ -582,6 +619,16 @@ peerparams:		/* empty */
 				CHECK_PARAMS_DO( ($4 > 0) && ($4 < 1<<16),
 					{ yyerror (&yylloc, conf, "Invalid port value"); YYERROR; } );
 				fddpi.config.pic_port = (uint16_t)$4;
+			}
+			| peerparams SCTPUDPPORT '=' INTEGER ';'
+			{
+				#ifndef USE_USRSCTP
+				yyerror (&yylloc, conf, "SCTP_UDP_Port requires a daemon compiled with the USE_USRSCTP option.");
+				YYERROR;
+				#endif /* USE_USRSCTP */
+				CHECK_PARAMS_DO( ($4 > 0) && ($4 < 1<<16),
+					{ yyerror (&yylloc, conf, "Invalid port value"); YYERROR; } );
+				fddpi.config.pic_sctp_udp_port = (uint16_t)$4;
 			}
 			| peerparams TCTIMER '=' INTEGER ';'
 			{
