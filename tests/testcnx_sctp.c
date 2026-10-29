@@ -7,7 +7,7 @@
 #include <cnxctx.h>
 
 #define TEST_SCTP_PORT		3869
-#define TEST_MESSAGE		"testcnx_sctp"
+#define TEST_MESSAGE		"Hello, world!"
 
 static struct fd_list endpoints = FD_LIST_INITIALIZER(endpoints);
 
@@ -86,7 +86,14 @@ int main(int argc, char *argv[])
 	CHECK(0, fd_cnx_receive(server, NULL, &received, &received_len));
 	CHECK(strlen(TEST_MESSAGE), received_len);
 	CHECK(0, memcmp(received, TEST_MESSAGE, received_len));
-	LOG_N("[testcnx_sctp] server: received %zu-byte payload; content verified", received_len);
+	LOG_N("[testcnx_sctp] server: echoing %zu-byte payload", received_len);
+	CHECK(0, fd_cnx_send(server, received, received_len));
+	free(received);
+
+	CHECK(0, fd_cnx_receive(client, NULL, &received, &received_len));
+	CHECK(strlen(TEST_MESSAGE), received_len);
+	CHECK(0, memcmp(received, TEST_MESSAGE, received_len));
+	LOG_N("[testcnx_sctp] client: received echoed payload; content verified", received_len);
 	free(received);
 
 	LOG_N("[testcnx_sctp] shutdown: closing client, accepted connection, and listener");
