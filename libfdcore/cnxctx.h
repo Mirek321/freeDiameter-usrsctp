@@ -42,7 +42,39 @@
 #define MAX_HOTL_BLOCKING_TIME	1000	/* ms */
 
 struct socket;
-struct fd_cnx_transport_ops;
+struct cnxctx;
+struct fd_usrsctp_cbctx;
+struct fd_cnx_transport_ops {
+	int (*create_server)(struct cnxctx *conn,
+                     int family,
+                     struct fd_list *endpoints,
+                     uint16_t port);
+	int (*listen)(struct cnxctx *conn, int backlog);
+	int (*accept)(struct cnxctx *listener, struct cnxctx *accepted);
+	int (*connect)(struct cnxctx *conn,
+	               int no_ip6,
+	               uint16_t port,
+	               struct fd_list *remote,
+	               struct fd_list *local);
+	int (*start_clear)(struct cnxctx *conn, int loop);
+	ssize_t (*recv)(struct cnxctx *conn, void *buffer, size_t length);
+	ssize_t (*send)(struct cnxctx *conn,
+	                uint16_t stream,
+	                const void *buffer,
+	                size_t length,
+	                int unordered);
+	int (*get_streams)(struct cnxctx *conn,
+	                   uint16_t *in,
+	                   uint16_t *out);
+	int (*get_remote_eps)(struct cnxctx *conn,
+	                      struct fd_list *eps);
+	void (*close)(struct cnxctx *conn);
+};
+
+#ifdef USE_USRSCTP
+extern const struct fd_cnx_transport_ops fd_usrsctp_ops;
+void fd_usrsctp_global_finish(void);
+#endif
 
 enum fd_cnx_transport_type {
 	FD_CNX_TRANSPORT_KERNEL,
@@ -60,6 +92,42 @@ struct fd_cnx_transport {
 	const struct fd_cnx_transport_ops *ops;
 };
 
+#ifdef USE_USRSCTP
+struct fd_usrsctp_partial {
+	struct fd_usrsctp_partial *next;
+	struct socket *socket;
+	uint32_t assoc_id;
+	uint16_t stream;
+	uint16_t ssn;
+	int notification;
+	uint8_t *buffer;
+	size_t length;
+	size_t capacity;
+};
+
+struct fd_usrsctp_data {
+	struct fd_usrsctp_data *next;
+	uint8_t *buffer;
+	size_t length;
+	size_t offset;
+};
+
+struct fd_usrsctp_cbctx {
+	pthread_mutex_t lock;
+	pthread_cond_t idle;
+	struct cnxctx *conn;
+	unsigned int callback_refs;
+	int closing;
+	pthread_t reader;
+	int reader_started;
+	pthread_cond_t acceptable;	/* listener: signalled by the read upcall */
+	unsigned int accept_events;	/* listener: upcalls since the last accept attempt */
+	struct fd_usrsctp_partial *partials;
+	struct fd_usrsctp_data *data_head;
+	struct fd_usrsctp_data *data_tail;
+};
+#endif
+
 /* The connection context structure */
 struct cnxctx {
 	char		cc_id[100];	/* The name of this connection. the first 5 chars are reserved for flags display (cc_state). */
@@ -67,6 +135,9 @@ struct cnxctx {
 
 	int 		cc_socket;	/* The socket object of the connection -- <=0 if no socket is created */
 	struct fd_cnx_transport cc_transport;
+#ifdef USE_USRSCTP
+	struct fd_usrsctp_cbctx *cc_usrsctp_cbctx;
+#endif
 
 	int 		cc_family;	/* AF_INET or AF_INET6 (mixed) */
 	int 		cc_proto;	/* IPPROTO_TCP or IPPROTO_SCTP */

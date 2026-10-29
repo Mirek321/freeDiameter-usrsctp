@@ -103,6 +103,8 @@ DECLARE_FD_DUMP_PROTOTYPE(fd_conf_dump)
 		CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  Local SCTP TLS port .... : %hu\n", fd_g_config->cnf_port_3436), return NULL);
 	}
 	CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  Number of SCTP streams . : %hu\n", fd_g_config->cnf_sctp_str), return NULL);
+#ifdef USE_USRSCTP
+#endif /* USE_USRSCTP */
 	CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  Number of clients thr .. : %d\n", fd_g_config->cnf_thr_srv), return NULL);
 	CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  Number of app threads .. : %hu\n", fd_g_config->cnf_dispthr), return NULL);
 	CHECK_MALLOC_DO( fd_dump_extend( FD_DUMP_STD_PARAMS, "  Minimal processing peers : %d\n", fd_g_config->cnf_processing_peers_minimum), return NULL);

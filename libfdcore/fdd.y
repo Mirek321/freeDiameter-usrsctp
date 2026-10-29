@@ -54,6 +54,7 @@
 %{
 #include "fdcore-internal.h"
 #include "fdd.tab.h"	/* bug : bison does not define the YYLTYPE before including this block, so... */
+#include <strings.h>
 
 /* The Lex parser prototype */
 int fddlex(YYSTYPE *lvalp, YYLTYPE *llocp);
