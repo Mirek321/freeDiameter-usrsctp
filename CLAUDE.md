@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A fork of freeDiameter (Diameter AAA protocol daemon, C, CMake) adding an optional
 **userspace SCTP transport (usrsctp)** next to the stock kernel-socket SCTP. Branch names
-and commit subjects follow `feat(#<issue> <scope>): ...`.
+Branches are `issue-<n>-<slug>`; commit subjects are `feat(<scope>): ...` (early ones carry `#<issue>`).
+Repo-wide guidelines (style, PR/commit conventions): `AGENTS.md`.
 
 ## Build and test
 
@@ -16,10 +17,11 @@ Two build flavours, each in its own out-of-tree dir (all `build*` dirs are gitig
 
     ./manage.sh build kernel      # -DUSE_USRSCTP=OFF -> build-kernel/
     ./manage.sh build usrsctp     # -DUSE_USRSCTP=ON  -> build-usrsctp/
-    ./manage.sh rebuild all       # wipe both dirs, configure, build, ctest
+    ./manage.sh rebuild all       # wipe both dirs, configure, build (no tests)
+    ./manage.sh test usrsctp testcnx   # ctest for one flavour, optional exact test name
     JOBS=4 ./manage.sh build usrsctp
 
-`manage.sh` = `cmake -S . -B build-<name> -DUSE_USRSCTP=..` + `cmake --build` + `ctest --output-on-failure`.
+`build` = `cmake -S . -B build-<name> -DUSE_USRSCTP=..` + `cmake --build`; it does not run tests.
 Default `CMAKE_BUILD_TYPE` is Debug (`-Wall -g -O0`, defines `DEBUG`). Useful cache options
 (all in `include/freeDiameter/CMakeLists.txt` / `extensions/CMakeLists.txt`):
 `USE_USRSCTP`, `DISABLE_SCTP`, `DEBUG_SCTP`, `ERRORS_ON_WARNINGS`, `ALL_EXTENSIONS`,
@@ -38,6 +40,8 @@ Always run the test suite in **both** flavours when touching `libfdcore/cnxctx.*
 
 Run the daemon: `build-kernel/freeDiameterd/freeDiameterd -c <conf>`; `doc/freediameter.conf.sample`
 documents every option, `doc/single_host/` has a ready two-peer setup (`make_certs.sh`).
+`doc/localhost/README.md` is a two-process usrsctp example; the daemon needs `CAP_NET_RAW`
+(`setcap cap_net_raw+ep`) to open raw SCTP sockets.
 
 ## Architecture
 
@@ -100,10 +104,13 @@ gets a reader thread, started from `start_clear`, that blocks in `usrsctp_recvv(
   which would leave usrsctp's accept lock held and deadlock `usrsctp_close()`. Accepted sockets
   inherit non-blocking mode and are switched back for the reader.
 
-Known gaps: TLS over usrsctp with multiple streams is not implemented – `sctp3436.c` and
-`rcvthr_notls_sctp` call `fd_sctp_sendstrv` / `fd_sctp_recvmeta` with the kernel fd; DTLS is
-a `TODO` in both backends. So `testcnx` in the usrsctp flavour stops at its first RFC 3436 case
-(`testcnx.c` "old Diameter behavior", `ALGO_HANDSHAKE_3436`); the clear-text SCTP cases before it pass.
+Known gaps:
+- TLS over multi-stream SCTP is not implemented for usrsctp: `sctp3436.c` and `rcvthr_notls_sctp`
+  (`cnxctx.c`) call `fd_sctp_sendstrv` / `fd_sctp_recvmeta`, which work on the kernel fd.
+- DTLS is unsupported: `fd_tls_prepare` rejects it; TODOs in `cnxctx.c`.
+- `testcnx` in the usrsctp flavour currently hits its 120 s timeout right after the first
+  clear-text SCTP connect succeeds (cause not yet diagnosed). The legacy RFC 3436 case is
+  compiled out under `USE_USRSCTP` (`tests/testcnx.c`).
 
 ### Vendored `usrsctp/`
 
