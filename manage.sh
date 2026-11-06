@@ -10,7 +10,8 @@ build_one() {
     local build_dir="${ROOT_DIR}/build-${name}"
 
     cmake -S "$ROOT_DIR" -B "$build_dir" \
-        -DUSE_USRSCTP="$use_usrsctp"
+        -DUSE_USRSCTP="$use_usrsctp" \
+        -DBUILD_TESTING=ON
 
     cmake --build "$build_dir" -j"$JOBS"
 }
@@ -22,15 +23,26 @@ test_one() {
     local build_dir="${ROOT_DIR}/build-${name}"
 
     if [ -n "$test_name" ]; then
-        ctest --test-dir "$build_dir" --output-on-failure -R "^${test_name}$"
+        ctest --test-dir "$build_dir" --output-on-failure --verbose -R "^${test_name}$"
+    elif [ "$name" = "usrsctp" ]; then
+        ctest --test-dir "$build_dir" --output-on-failure --verbose -R "usrsctp$"
     else
-        ctest --test-dir "$build_dir" --output-on-failure
+        ctest --test-dir "$build_dir" --output-on-failure --verbose
     fi
 }
 
 clean_one() {
     local name="$1"
     rm -rf "${ROOT_DIR}/build-${name}"
+}
+
+set_usrsctp_test_capabilities() {
+    local test_bin
+    for test_bin in "${ROOT_DIR}/build-usrsctp/tests/"*; do
+        if [ -f "$test_bin" ] && [ -x "$test_bin" ]; then
+            sudo setcap cap_net_raw+ep "$test_bin"
+        fi
+    done
 }
 
 run_one() {
@@ -55,6 +67,9 @@ run_one() {
     fi
 
     build_one "$name" "$use_usrsctp"
+    if [ "$name" = "usrsctp" ]; then
+        set_usrsctp_test_capabilities
+    fi
 }
 
 action="${1:-build}"
@@ -73,6 +88,7 @@ case "$action:$name" in
         clean_one usrsctp
         build_one kernel OFF
         build_one usrsctp ON
+        set_usrsctp_test_capabilities
         ;;
     test:kernel)
         test_one kernel OFF "$test_name"

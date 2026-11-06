@@ -29,7 +29,10 @@ SET(TEST_LIST
 	testsess
 	testdisp
 	testcnx
-	testcnx_sctp
+	testcnx_big_msg_usrsctp
+	testcnx_binary_msg_usrsctp
+	testcnx_echo_msg_usrsctp
+	testcnx_multiple_msg_usrsctp
 	testloadext
 )
 
